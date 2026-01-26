@@ -19,6 +19,7 @@ from google.genai import types
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from youtube_uploader import upload_video
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1428,6 +1429,43 @@ keep the following in mind:
             if self.current_match_filepath and os.path.exists(self.current_match_filepath):
                 participant_names = [stat.player_name for stat in stats]
                 self.add_metadata_to_mp4(self.current_match_filepath, participant_names)
+            
+            # Upload to YouTube
+            if self.current_match_filepath and os.path.exists(self.current_match_filepath):
+                print("\nUploading match video to YouTube...")
+                
+                # Prepare metadata for YouTube upload
+                metadata = {
+                    'players': [{
+                        'name': stat.player_name,
+                        'character': stat.smash_character,
+                        'kos': stat.total_kos,
+                        'falls': stat.total_falls,
+                        'sds': stat.total_sds,
+                        'won': stat.has_won
+                    } for stat in stats],
+                    'timestamp': datetime.datetime.now()
+                }
+                
+                try:
+                    youtube_url = upload_video(self.current_match_filepath, match_id, metadata)
+                    
+                    if youtube_url:
+                        print(f"✅ Video uploaded to YouTube: {youtube_url}")
+                        
+                        # Save YouTube URL to database
+                        try:
+                            self.supabase_client.table("matches").update({
+                                "youtube_url": youtube_url
+                            }).eq("id", match_id).execute()
+                            print("YouTube URL saved to database")
+                        except Exception as e:
+                            self.logger.error(f"Failed to save YouTube URL to database: {e}")
+                    else:
+                        print("⚠️ YouTube upload failed. Video saved locally.")
+                except Exception as e:
+                    self.logger.error(f"Error during YouTube upload: {e}")
+                    print("⚠️ YouTube upload failed. Video saved locally.")
             
         except Exception as e:
             print(f"Error saving match stats: {e}")

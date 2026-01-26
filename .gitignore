@@ -130,6 +130,11 @@ center_region_*.png
 game_region_*.png
 full_frame_*.png
 
+# YouTube credentials (KEEP THESE SECRET!)
+client_secrets.json
+youtube-upload-credentials.pickle
+*-oauth2.json
+
 # Temporary files
 *.tmp
 *.temp
