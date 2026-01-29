@@ -13,6 +13,7 @@ import subprocess
 from typing import List, Optional, Dict, Tuple
 import pandas as pd
 import pytz
+import requests
 from elo_utils import calculate_elo_update_for_streaming, update_inactivity_status
 from google import genai
 from google.genai import types
@@ -66,6 +67,28 @@ try:
 except Exception as e:
     print(f"Warning: Failed to initialize Supabase client: {e}")
     supabase_client = None
+
+
+def invalidate_frontend_cache():
+    """Invalidate the frontend cache after a match is saved"""
+    frontend_url = os.getenv("FRONTEND_URL")
+    if not frontend_url:
+        print("FRONTEND_URL not set, skipping cache invalidation")
+        return
+
+    try:
+        response = requests.post(
+            f"{frontend_url}/api/revalidate",
+            json={"tags": ["players", "matches"]},
+            timeout=5
+        )
+        if response.ok:
+            print(f"Frontend cache invalidated: {response.json()}")
+        else:
+            print(f"Failed to invalidate cache: {response.status_code}")
+    except Exception as e:
+        print(f"Failed to invalidate frontend cache: {e}")
+
 
 class SmashBrosProcessor:
     def __init__(self, device_index=0, output_dir="matches", test_mode=False, test_video_path=None,
@@ -1422,7 +1445,10 @@ keep the following in mind:
             # Update inactivity status for all players
             print("\nUpdating inactivity status...")
             update_inactivity_status(self.supabase_client)
-            
+
+            # Invalidate frontend cache so leaderboard updates immediately
+            invalidate_frontend_cache()
+
             print("="*60)
             
             # Add metadata to match video file
