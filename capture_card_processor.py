@@ -76,16 +76,17 @@ def invalidate_frontend_cache():
         print("FRONTEND_URL not set, skipping cache invalidation")
         return
 
+    tags = ["players", "matches"]
     try:
-        response = requests.post(
+        response = requests.get(
             f"{frontend_url}/api/revalidate",
-            json={"tags": ["players", "matches"]},
-            timeout=5
+            params={"tags": ",".join(tags)},
+            timeout=10
         )
         if response.ok:
             print(f"Frontend cache invalidated: {response.json()}")
         else:
-            print(f"Failed to invalidate cache: {response.status_code}")
+            print(f"Failed to invalidate cache: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Failed to invalidate frontend cache: {e}")
 
