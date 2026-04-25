@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone
 import pytz
 from elo_utils import (
-    update_elo
+    normalize_character_name,
+    update_elo,
 )
 
 # Load environment variables from .env file
@@ -378,6 +379,179 @@ def calculate_elos_pandas(matches_df: pd.DataFrame, participants_df: pd.DataFram
     
     return players_final
 
+
+def calculate_character_elos_pandas(
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    players_updated: pd.DataFrame,
+) -> pd.DataFrame:
+    """Calculate persisted character ELO rows using the same ranked-player eligibility as overall ELO."""
+
+    ranked_player_ids = set(
+        players_updated[players_updated["top_ten_played_new"] >= 3]["id"].tolist()
+    )
+
+    print(f"    Total ranked players eligible for character ELO: {len(ranked_player_ids)}")
+
+    match_participant_counts = participants_df.groupby("match_id").size()
+    valid_matches = match_participant_counts[match_participant_counts == 2].index
+    valid_matches_df = matches_df[matches_df["id"].isin(valid_matches)].sort_values(
+        "created_at"
+    )
+
+    character_rows: Dict[Tuple[object, str], Dict[str, object]] = {}
+    character_elo_updates = 0
+
+    for _, match in valid_matches_df.iterrows():
+        match_id = match["id"]
+        match_participants = participants_df[participants_df["match_id"] == match_id]
+
+        if len(match_participants) != 2:
+            continue
+
+        winners = match_participants[match_participants["has_won"] == True]["player"].tolist()
+        if len(winners) != 1:
+            continue
+
+        participant_1 = match_participants.iloc[0]
+        participant_2 = match_participants.iloc[1]
+
+        player_1_id = participant_1["player"]
+        player_2_id = participant_2["player"]
+
+        if player_1_id not in ranked_player_ids or player_2_id not in ranked_player_ids:
+            continue
+
+        character_1 = normalize_character_name(participant_1["smash_character"])
+        character_2 = normalize_character_name(participant_2["smash_character"])
+        key_1 = (player_1_id, character_1)
+        key_2 = (player_2_id, character_2)
+
+        row_1 = character_rows.setdefault(
+            key_1,
+            {
+                "player": player_1_id,
+                "smash_character": character_1,
+                "elo": 1200,
+                "total_wins": 0,
+                "total_losses": 0,
+                "total_kos": 0,
+                "total_falls": 0,
+                "total_sds": 0,
+                "current_win_streak": 0,
+                "last_match_date": None,
+            },
+        )
+        row_2 = character_rows.setdefault(
+            key_2,
+            {
+                "player": player_2_id,
+                "smash_character": character_2,
+                "elo": 1200,
+                "total_wins": 0,
+                "total_losses": 0,
+                "total_kos": 0,
+                "total_falls": 0,
+                "total_sds": 0,
+                "current_win_streak": 0,
+                "last_match_date": None,
+            },
+        )
+
+        winner_id = winners[0]
+        winner = "A" if winner_id == player_1_id else "B"
+
+        new_elo_1, new_elo_2 = update_elo(row_1["elo"], row_2["elo"], winner)
+        row_1["elo"] = new_elo_1
+        row_2["elo"] = new_elo_2
+
+        row_1["total_wins"] += 1 if winner == "A" else 0
+        row_1["total_losses"] += 1 if winner == "B" else 0
+        row_1["total_kos"] += int(participant_1["total_kos"])
+        row_1["total_falls"] += int(participant_1["total_falls"])
+        row_1["total_sds"] += int(participant_1["total_sds"])
+        row_1["current_win_streak"] = (
+            int(row_1["current_win_streak"]) + 1 if winner == "A" else 0
+        )
+        row_1["last_match_date"] = match["created_at"]
+
+        row_2["total_wins"] += 1 if winner == "B" else 0
+        row_2["total_losses"] += 1 if winner == "A" else 0
+        row_2["total_kos"] += int(participant_2["total_kos"])
+        row_2["total_falls"] += int(participant_2["total_falls"])
+        row_2["total_sds"] += int(participant_2["total_sds"])
+        row_2["current_win_streak"] = (
+            int(row_2["current_win_streak"]) + 1 if winner == "B" else 0
+        )
+        row_2["last_match_date"] = match["created_at"]
+
+        character_elo_updates += 1
+
+    print(f"    Character ELO updates applied: {character_elo_updates}")
+
+    if not character_rows:
+        return pd.DataFrame(
+            columns=[
+                "player",
+                "smash_character",
+                "elo",
+                "total_wins",
+                "total_losses",
+                "total_kos",
+                "total_falls",
+                "total_sds",
+                "current_win_streak",
+                "last_match_date",
+            ]
+        )
+
+    return pd.DataFrame(list(character_rows.values()))
+
+
+def replace_character_rankings_in_db(character_rankings_df: pd.DataFrame):
+    """Replace the persisted character ranking table with freshly recomputed rows."""
+    try:
+        supabase_client.table("character_rankings").delete().gte("id", 0).execute()
+    except Exception as e:
+        print(f"Error clearing character_rankings table: {e}")
+        raise
+
+    if len(character_rankings_df) == 0:
+        print("    No character ranking rows to insert")
+        return
+
+    records = []
+    for _, row in character_rankings_df.iterrows():
+        last_match_date = row["last_match_date"]
+        if pd.isna(last_match_date):
+            last_match_date_iso = None
+        elif hasattr(last_match_date, "isoformat"):
+            last_match_date_iso = last_match_date.isoformat()
+        else:
+            last_match_date_iso = str(last_match_date)
+
+        records.append(
+            {
+                "player": row["player"],
+                "smash_character": row["smash_character"],
+                "elo": int(row["elo"]),
+                "total_wins": int(row["total_wins"]),
+                "total_losses": int(row["total_losses"]),
+                "total_kos": int(row["total_kos"]),
+                "total_falls": int(row["total_falls"]),
+                "total_sds": int(row["total_sds"]),
+                "current_win_streak": int(row["current_win_streak"]),
+                "last_match_date": last_match_date_iso,
+            }
+        )
+
+    batch_size = 500
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        supabase_client.table("character_rankings").insert(batch).execute()
+
+    print(f"    Inserted {len(records)} character ranking rows")
+
 def recompute_all_player_elos_old_method():
     """Old sequential method for comparison"""
     print("="*60)
@@ -517,8 +691,16 @@ def recompute_all_player_elos():
             update_player_stats_in_db(player['id'], int(player['elo_final']), int(player['top_ten_played_new']))
         except Exception as e:
             print(f"  Failed to update {player['name']}: {e}")
+
+    # Step 6: Rebuild persisted character rankings
+    print("\nCalculating character ELOs...")
+    character_rankings_df = calculate_character_elos_pandas(
+        matches_df, participants_df, players_with_top_ten
+    )
+    print("\nUpdating database with character ELOs...")
+    replace_character_rankings_in_db(character_rankings_df)
     
-    # Step 6: Print final rankings (exclude 1200 ELO unranked players)
+    # Step 7: Print final rankings (exclude 1200 ELO unranked players)
     print("\n" + "="*60)
     print("FINAL ELO RANKINGS")
     print("="*60)

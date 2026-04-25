@@ -26,7 +26,11 @@ from dotenv import load_dotenv
 import re
 import pandas as pd
 import pytz
-from elo_utils import calculate_elo_update_for_streaming, update_inactivity_status
+from elo_utils import (
+    calculate_elo_update_for_streaming,
+    update_character_rankings_for_streaming,
+    update_inactivity_status,
+)
 
 # Load environment variables
 load_dotenv()
@@ -380,14 +384,43 @@ keep the following in mind:
                 winner = 'A' if winner_index == 1 else 'B'
                 
                 # Use shared ELO calculation
-                new_elo_1, new_elo_2 = calculate_elo_update_for_streaming(
+                new_elo_1, new_elo_2, elo_metadata = calculate_elo_update_for_streaming(
                     old_elo_1, old_elo_2, winner,
                     players[0]['id'], players[1]['id'],
-                    supabase_client
+                    supabase_client,
+                    return_metadata=True,
                 )
                 
                 self.update_player_elo(players[0]['id'], new_elo_1)
                 self.update_player_elo(players[1]['id'], new_elo_2)
+
+                if not elo_metadata.get("triggered_full_recompute"):
+                    new_character_elos = update_character_rankings_for_streaming(
+                        players[0]['id'],
+                        players[1]['id'],
+                        players[0]['character'],
+                        players[1]['character'],
+                        winner,
+                        {
+                            "kos": players[0]['kos'],
+                            "falls": players[0]['falls'],
+                            "sds": players[0]['sds'],
+                        },
+                        {
+                            "kos": players[1]['kos'],
+                            "falls": players[1]['falls'],
+                            "sds": players[1]['sds'],
+                        },
+                        supabase_client,
+                        match_created_at=datetime.datetime.now(datetime.timezone.utc),
+                    )
+
+                    if new_character_elos:
+                        char_elo_1, char_elo_2 = new_character_elos
+                        self.logger.info(
+                            f"  Character ELOs: {players[0]['character']} -> {char_elo_1}, "
+                            f"{players[1]['character']} -> {char_elo_2}"
+                        )
                 
                 # Print ELO changes
                 elo_change_1 = new_elo_1 - old_elo_1

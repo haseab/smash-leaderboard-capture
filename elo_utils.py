@@ -6,8 +6,180 @@ This module contains all ELO calculation functions.
 """
 
 import datetime
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from supabase import Client
+
+
+CHARACTER_NAME_NORMALIZATION = {
+    "ENDERMAN": "STEVE",
+    "STEVE": "STEVE",
+    "ALEX": "STEVE",
+    "ZOMBIE": "STEVE",
+    "KING K ROOL": "KING K. ROOL",
+    "KING K. ROOL": "KING K. ROOL",
+    "ROSALINA": "ROSALINA & LUMA",
+}
+
+
+def normalize_character_name(character_name: str) -> str:
+    """Normalize character aliases so the same character shares one ranking row."""
+    normalized_name = (character_name or "").strip().upper()
+    return CHARACTER_NAME_NORMALIZATION.get(normalized_name, normalized_name)
+
+
+def _coerce_match_created_at(
+    match_created_at: Optional[Union[datetime.datetime, str]],
+) -> str:
+    if match_created_at is None:
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    if isinstance(match_created_at, datetime.datetime):
+        if match_created_at.tzinfo is None:
+            match_created_at = match_created_at.replace(
+                tzinfo=datetime.timezone.utc
+            )
+        return match_created_at.isoformat()
+
+    return str(match_created_at)
+
+
+def upsert_character_rankings(
+    rows: List[Dict[str, Any]], supabase_client: Client
+) -> bool:
+    """Upsert persisted character ranking rows keyed by (player, smash_character)."""
+    if not rows:
+        return True
+
+    try:
+        supabase_client.table("character_rankings").upsert(
+            rows,
+            on_conflict="player,smash_character",
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"Error upserting character rankings: {e}")
+        return False
+
+
+def update_character_rankings_for_streaming(
+    player_a_id: str,
+    player_b_id: str,
+    character_a: str,
+    character_b: str,
+    winner: str,
+    player_a_match_stats: Dict[str, int],
+    player_b_match_stats: Dict[str, int],
+    supabase_client: Client,
+    match_created_at: Optional[Union[datetime.datetime, str]] = None,
+    k: int = 32,
+) -> Optional[Tuple[int, int]]:
+    """
+    Persist memoized character ELO/stats for a single 1v1 match.
+
+    Character rankings use the same ranked-player gating as overall player ELO:
+    the match only affects character rows when both underlying players are ranked.
+    """
+    try:
+        players_response = (
+            supabase_client.table("players")
+            .select("id, top_ten_played")
+            .in_("id", [player_a_id, player_b_id])
+            .execute()
+        )
+        players_data = {player["id"]: player for player in players_response.data}
+
+        player_a_data = players_data.get(player_a_id)
+        player_b_data = players_data.get(player_b_id)
+
+        if (
+            not player_a_data
+            or not player_b_data
+            or player_a_data.get("top_ten_played", 0) < 3
+            or player_b_data.get("top_ten_played", 0) < 3
+        ):
+            return None
+
+        normalized_character_a = normalize_character_name(character_a)
+        normalized_character_b = normalize_character_name(character_b)
+
+        existing_rows_response = (
+            supabase_client.table("character_rankings")
+            .select("*")
+            .in_("player", [player_a_id, player_b_id])
+            .in_(
+                "smash_character",
+                [normalized_character_a, normalized_character_b],
+            )
+            .execute()
+        )
+        existing_rows = {
+            (row["player"], row["smash_character"]): row
+            for row in existing_rows_response.data
+        }
+
+        existing_row_a = existing_rows.get((player_a_id, normalized_character_a), {})
+        existing_row_b = existing_rows.get((player_b_id, normalized_character_b), {})
+
+        rating_a = int(existing_row_a.get("elo", 1200))
+        rating_b = int(existing_row_b.get("elo", 1200))
+        new_rating_a, new_rating_b = update_elo(rating_a, rating_b, winner, k)
+        match_created_at_iso = _coerce_match_created_at(match_created_at)
+
+        winner_upper = winner.upper()
+        row_a = {
+            "player": player_a_id,
+            "smash_character": normalized_character_a,
+            "elo": new_rating_a,
+            "total_wins": int(existing_row_a.get("total_wins", 0))
+            + (1 if winner_upper == "A" else 0),
+            "total_losses": int(existing_row_a.get("total_losses", 0))
+            + (1 if winner_upper == "B" else 0),
+            "total_kos": int(existing_row_a.get("total_kos", 0))
+            + int(player_a_match_stats.get("kos", 0)),
+            "total_falls": int(existing_row_a.get("total_falls", 0))
+            + int(player_a_match_stats.get("falls", 0)),
+            "total_sds": int(existing_row_a.get("total_sds", 0))
+            + int(player_a_match_stats.get("sds", 0)),
+            "current_win_streak": (
+                int(existing_row_a.get("current_win_streak", 0)) + 1
+                if winner_upper == "A"
+                else 0
+            ),
+            "last_match_date": match_created_at_iso,
+        }
+        row_b = {
+            "player": player_b_id,
+            "smash_character": normalized_character_b,
+            "elo": new_rating_b,
+            "total_wins": int(existing_row_b.get("total_wins", 0))
+            + (1 if winner_upper == "B" else 0),
+            "total_losses": int(existing_row_b.get("total_losses", 0))
+            + (1 if winner_upper == "A" else 0),
+            "total_kos": int(existing_row_b.get("total_kos", 0))
+            + int(player_b_match_stats.get("kos", 0)),
+            "total_falls": int(existing_row_b.get("total_falls", 0))
+            + int(player_b_match_stats.get("falls", 0)),
+            "total_sds": int(existing_row_b.get("total_sds", 0))
+            + int(player_b_match_stats.get("sds", 0)),
+            "current_win_streak": (
+                int(existing_row_b.get("current_win_streak", 0)) + 1
+                if winner_upper == "B"
+                else 0
+            ),
+            "last_match_date": match_created_at_iso,
+        }
+
+        if not upsert_character_rankings([row_a, row_b], supabase_client):
+            return None
+
+        return new_rating_a, new_rating_b
+
+    except Exception as e:
+        print(
+            "Error updating character rankings for match "
+            f"{player_a_id} vs {player_b_id}: {e}"
+        )
+        return None
 
 
 def calculate_top_ten_played_for_player(player_id: str, supabase_client: Client) -> int:
@@ -427,9 +599,16 @@ def update_inactivity_status(supabase_client: Client, inactivity_threshold_weeks
         return False
 
 
-def calculate_elo_update_for_streaming(rating_a: float, rating_b: float, winner: str,
-                                     player_a_id: str, player_b_id: str,
-                                     supabase_client: Client, k: int = 32) -> Tuple[int, int]:
+def calculate_elo_update_for_streaming(
+    rating_a: float,
+    rating_b: float,
+    winner: str,
+    player_a_id: str,
+    player_b_id: str,
+    supabase_client: Client,
+    k: int = 32,
+    return_metadata: bool = False,
+):
     """
     High-level function to calculate ELO update for streaming (real-time) processing.
     Only processes ELO updates if both players are ranked (top_ten_played >= 3).
@@ -438,6 +617,8 @@ def calculate_elo_update_for_streaming(rating_a: float, rating_b: float, winner:
     Returns:
         tuple[int, int]: (new_elo_a, new_elo_b)
     """
+    metadata = {"triggered_full_recompute": False}
+
     # Check if both players are ranked before processing ELO updates
     players_response = supabase_client.table("players").select("id, elo, top_ten_played").execute()
     players_data = {p['id']: p for p in players_response.data}
@@ -466,6 +647,7 @@ def calculate_elo_update_for_streaming(rating_a: float, rating_b: float, winner:
     # This is necessary because newly ranked players affect everyone's historical ELOs
     if newly_ranked_players:
         print(f"Triggering full ELO recompute due to newly ranked players: {newly_ranked_players}")
+        metadata["triggered_full_recompute"] = True
         # Import and run the batch recompute function
         try:
             import sys
@@ -483,8 +665,13 @@ def calculate_elo_update_for_streaming(rating_a: float, rating_b: float, winner:
     if (not player_a_data or not player_b_data or 
         player_a_data.get('top_ten_played', 0) < 3 or 
         player_b_data.get('top_ten_played', 0) < 3):
-        return int(rating_a), int(rating_b)
+        result = (int(rating_a), int(rating_b))
+        if return_metadata:
+            return result[0], result[1], metadata
+        return result
     
     # Use normal ELO calculation
     new_elo_a, new_elo_b = update_elo(rating_a, rating_b, winner, k)
+    if return_metadata:
+        return new_elo_a, new_elo_b, metadata
     return new_elo_a, new_elo_b
