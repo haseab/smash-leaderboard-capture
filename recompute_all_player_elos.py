@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import pytz
 from elo_utils import (
     normalize_character_name,
+    persist_match_participant_elo_diffs,
     update_elo,
 )
 
@@ -304,7 +305,7 @@ def get_inactive_player_last_match_dates(players_df: pd.DataFrame, matches_df: p
     return inactive_player_dates
 
 def calculate_elos_pandas(matches_df: pd.DataFrame, participants_df: pd.DataFrame, 
-                         players_updated: pd.DataFrame) -> pd.DataFrame:
+                         players_updated: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Second pass: Calculate ELOs only for matches between ranked players"""
     
     # Get ranked players (top_ten_played_new >= 3)
@@ -314,6 +315,8 @@ def calculate_elos_pandas(matches_df: pd.DataFrame, participants_df: pd.DataFram
     
     # Initialize ELOs to 1200 for all players
     current_elos = {player_id: 1200 for player_id in players_updated['id']}
+    participants_with_elo = participants_df.copy()
+    participants_with_elo['elo_diff'] = None
     
     # Filter 1v1 matches only
     match_participant_counts = participants_df.groupby('match_id').size()
@@ -357,6 +360,13 @@ def calculate_elos_pandas(matches_df: pd.DataFrame, participants_df: pd.DataFram
             
             # Use normal ELO calculation
             new_elo1, new_elo2 = update_elo(elo1, elo2, winner)
+
+            participants_with_elo.loc[
+                match_participants.index[0], 'elo_diff'
+            ] = int(new_elo1 - elo1)
+            participants_with_elo.loc[
+                match_participants.index[1], 'elo_diff'
+            ] = int(new_elo2 - elo2)
             
             # Update ELOs
             current_elos[player1_id] = new_elo1
@@ -377,7 +387,32 @@ def calculate_elos_pandas(matches_df: pd.DataFrame, participants_df: pd.DataFram
     players_final = players_updated.copy()
     players_final['elo_final'] = players_final['id'].map(current_elos)
     
-    return players_final
+    return players_final, participants_with_elo[['id', 'elo_diff']]
+
+
+def update_match_participant_elo_diffs_in_db(participant_diffs_df: pd.DataFrame):
+    """Persist recomputed participant-level Elo deltas in batches."""
+    if len(participant_diffs_df) == 0:
+        print("    No participant Elo diffs to update")
+        return
+
+    records = []
+    for _, row in participant_diffs_df.iterrows():
+        elo_diff = row['elo_diff']
+        records.append(
+            {
+                "id": int(row["id"]),
+                "elo_diff": None if pd.isna(elo_diff) else int(elo_diff),
+            }
+        )
+
+    batch_size = 500
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        if not persist_match_participant_elo_diffs(batch, supabase_client):
+            raise RuntimeError("Failed to persist match participant Elo diffs")
+
+    print(f"    Updated {len(records)} participant Elo diff rows")
 
 
 def calculate_character_elos_pandas(
@@ -682,7 +717,11 @@ def recompute_all_player_elos():
     
     # Step 4: Second pass - Calculate ELOs
     print("\nCalculating ELOs...")
-    players_final = calculate_elos_pandas(matches_df, participants_df, players_with_top_ten)
+    players_final, participant_diffs_df = calculate_elos_pandas(
+        matches_df,
+        participants_df,
+        players_with_top_ten,
+    )
     
     # Step 5: Update database with calculated ELOs
     print("\nUpdating database with calculated ELOs...")
@@ -691,6 +730,9 @@ def recompute_all_player_elos():
             update_player_stats_in_db(player['id'], int(player['elo_final']), int(player['top_ten_played_new']))
         except Exception as e:
             print(f"  Failed to update {player['name']}: {e}")
+
+    print("\nUpdating database with participant Elo diffs...")
+    update_match_participant_elo_diffs_in_db(participant_diffs_df)
 
     # Step 6: Rebuild persisted character rankings
     print("\nCalculating character ELOs...")

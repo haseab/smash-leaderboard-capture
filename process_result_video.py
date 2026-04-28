@@ -28,6 +28,7 @@ import pandas as pd
 import pytz
 from elo_utils import (
     calculate_elo_update_for_streaming,
+    persist_match_participant_elo_diffs,
     update_character_rankings_for_streaming,
     update_inactivity_status,
 )
@@ -334,6 +335,7 @@ keep the following in mind:
                     .insert({
                         "player": player['id'], 
                         "smash_character": stat.smash_character.upper(),
+                        "elo_diff": None,
                         "is_cpu": stat.is_cpu,
                         "total_kos": stat.total_kos,
                         "total_falls": stat.total_falls,
@@ -346,6 +348,11 @@ keep the following in mind:
                 
                 players.append({
                     "id": player['id'], 
+                    "participant_id": (
+                        response.data[0]['id']
+                        if response.data and len(response.data) > 0
+                        else None
+                    ),
                     "elo": player['elo'], 
                     "name": player['display_name'], 
                     "character": stat.smash_character,
@@ -390,9 +397,36 @@ keep the following in mind:
                     supabase_client,
                     return_metadata=True,
                 )
-                
-                self.update_player_elo(players[0]['id'], new_elo_1)
-                self.update_player_elo(players[1]['id'], new_elo_2)
+
+                elo_change_1 = new_elo_1 - old_elo_1
+                elo_change_2 = new_elo_2 - old_elo_2
+
+                if not elo_metadata.get("triggered_full_recompute"):
+                    self.update_player_elo(players[0]['id'], new_elo_1)
+                    self.update_player_elo(players[1]['id'], new_elo_2)
+
+                    if elo_change_1 != 0 or elo_change_2 != 0:
+                        persist_match_participant_elo_diffs(
+                            [
+                                {
+                                    "id": players[0].get("participant_id"),
+                                    "match_id": match_id,
+                                    "player": players[0]['id'],
+                                    "elo_diff": elo_change_1,
+                                },
+                                {
+                                    "id": players[1].get("participant_id"),
+                                    "match_id": match_id,
+                                    "player": players[1]['id'],
+                                    "elo_diff": elo_change_2,
+                                },
+                            ],
+                            supabase_client,
+                        )
+                else:
+                    self.logger.info(
+                        "  Full recompute handled player ELO and participant elo_diff updates."
+                    )
 
                 if not elo_metadata.get("triggered_full_recompute"):
                     new_character_elos = update_character_rankings_for_streaming(
@@ -421,10 +455,6 @@ keep the following in mind:
                             f"  Character ELOs: {players[0]['character']} -> {char_elo_1}, "
                             f"{players[1]['character']} -> {char_elo_2}"
                         )
-                
-                # Print ELO changes
-                elo_change_1 = new_elo_1 - old_elo_1
-                elo_change_2 = new_elo_2 - old_elo_2
                 
                 self.logger.info(f"  {players[0]['name']}: {old_elo_1} → {new_elo_1} ({elo_change_1:+d})")
                 self.logger.info(f"  {players[1]['name']}: {old_elo_2} → {new_elo_2} ({elo_change_2:+d})")

@@ -61,6 +61,84 @@ def upsert_character_rankings(
         return False
 
 
+def persist_match_participant_elo_diffs(
+    rows: List[Dict[str, Any]], supabase_client: Client
+) -> bool:
+    """Persist participant-level Elo deltas for existing match_participants rows."""
+    if not rows:
+        return True
+
+    id_rows: List[Dict[str, Any]] = []
+    fallback_rows: List[Dict[str, Any]] = []
+
+    for row in rows:
+        if row.get("id") is not None:
+            id_rows.append(row)
+            continue
+
+        if row.get("match_id") is not None and row.get("player") is not None:
+            fallback_rows.append(row)
+
+    try:
+        batch_size = 500
+        for start in range(0, len(id_rows), batch_size):
+            batch = id_rows[start : start + batch_size]
+            batch_ids = [int(row["id"]) for row in batch]
+            existing_rows_response = (
+                supabase_client.table("match_participants")
+                .select(
+                    "id, match_id, player, smash_character, is_cpu, total_kos, "
+                    "total_falls, total_sds, has_won"
+                )
+                .in_("id", batch_ids)
+                .execute()
+            )
+            existing_rows = existing_rows_response.data or []
+            existing_rows_by_id = {
+                int(existing_row["id"]): existing_row for existing_row in existing_rows
+            }
+            upsert_batch: List[Dict[str, Any]] = []
+
+            for row in batch:
+                participant_id = int(row["id"])
+                existing_row = existing_rows_by_id.get(participant_id)
+
+                if not existing_row:
+                    raise RuntimeError(
+                        f"Missing match_participants row for id={participant_id}"
+                    )
+
+                upsert_batch.append(
+                    {
+                        "id": participant_id,
+                        "match_id": existing_row["match_id"],
+                        "player": existing_row["player"],
+                        "smash_character": existing_row["smash_character"],
+                        "is_cpu": existing_row["is_cpu"],
+                        "total_kos": existing_row["total_kos"],
+                        "total_falls": existing_row["total_falls"],
+                        "total_sds": existing_row["total_sds"],
+                        "has_won": existing_row["has_won"],
+                        "elo_diff": row.get("elo_diff"),
+                    }
+                )
+
+            supabase_client.table("match_participants").upsert(
+                upsert_batch,
+                on_conflict="id",
+            ).execute()
+
+        for row in fallback_rows:
+            supabase_client.table("match_participants").update(
+                {"elo_diff": row.get("elo_diff")}
+            ).eq("match_id", row["match_id"]).eq("player", row["player"]).execute()
+
+        return True
+    except Exception as e:
+        print(f"Error persisting match participant Elo diffs: {e}")
+        return False
+
+
 def update_character_rankings_for_streaming(
     player_a_id: str,
     player_b_id: str,
@@ -655,6 +733,28 @@ def calculate_elo_update_for_streaming(
             sys.path.append(os.path.dirname(os.path.abspath(__file__)))
             from recompute_all_player_elos import recompute_all_player_elos
             recompute_all_player_elos()
+
+            refreshed_players_response = (
+                supabase_client.table("players")
+                .select("id, elo, top_ten_played")
+                .in_("id", [player_a_id, player_b_id])
+                .execute()
+            )
+            refreshed_players = {
+                player["id"]: player for player in refreshed_players_response.data
+            }
+
+            refreshed_player_a = refreshed_players.get(player_a_id)
+            refreshed_player_b = refreshed_players.get(player_b_id)
+
+            if refreshed_player_a and refreshed_player_b:
+                result = (
+                    int(refreshed_player_a.get("elo", rating_a)),
+                    int(refreshed_player_b.get("elo", rating_b)),
+                )
+                if return_metadata:
+                    return result[0], result[1], metadata
+                return result
         except Exception as e:
             print(f"Error during full recompute: {e}")
             # Fall back to individual recalculation if batch fails

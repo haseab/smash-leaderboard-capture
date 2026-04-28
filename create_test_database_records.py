@@ -121,6 +121,7 @@ def create_test_matches():
                     'match_id': match['id'],
                     'player': player_ids[player_name],
                     'smash_character': participant['character'],
+                    'elo_diff': None,
                     'is_cpu': False,
                     'total_kos': participant['kos'],
                     'total_falls': participant['falls'],
