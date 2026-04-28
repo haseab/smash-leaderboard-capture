@@ -31,6 +31,7 @@ from elo_utils import (
     persist_match_participant_elo_diffs,
     update_character_rankings_for_streaming,
     update_inactivity_status,
+    update_team_rankings_for_streaming,
 )
 
 # Load environment variables
@@ -458,6 +459,36 @@ keep the following in mind:
                 
                 self.logger.info(f"  {players[0]['name']}: {old_elo_1} → {new_elo_1} ({elo_change_1:+d})")
                 self.logger.info(f"  {players[1]['name']}: {old_elo_2} → {new_elo_2} ({elo_change_2:+d})")
+
+            if len(players) == 4:
+                self.logger.info("2v2 Match detected - Updating team ELO ratings:")
+                team_elo_result = update_team_rankings_for_streaming(
+                    players,
+                    supabase_client,
+                    match_created_at=datetime.datetime.now(datetime.timezone.utc),
+                )
+
+                if team_elo_result:
+                    winning_names = [
+                        player["name"] for player in players if player["has_won"]
+                    ]
+                    losing_names = [
+                        player["name"] for player in players if not player["has_won"]
+                    ]
+                    winning_team = team_elo_result["winning_team"]
+                    losing_team = team_elo_result["losing_team"]
+                    self.logger.info(
+                        "  "
+                        f"{' + '.join(winning_names)}: "
+                        f"{team_elo_result['old_winning_elo']} → {winning_team['elo']}"
+                    )
+                    self.logger.info(
+                        "  "
+                        f"{' + '.join(losing_names)}: "
+                        f"{team_elo_result['old_losing_elo']} → {losing_team['elo']}"
+                    )
+                else:
+                    self.logger.info("  Team ELO unchanged; match was not eligible.")
             
             # Update inactivity status for all players
             self.logger.info("Updating inactivity status...")

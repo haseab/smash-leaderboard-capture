@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone
 import pytz
 from elo_utils import (
+    normalize_team_player_ids,
     normalize_character_name,
     persist_match_participant_elo_diffs,
     update_elo,
@@ -587,6 +588,178 @@ def replace_character_rankings_in_db(character_rankings_df: pd.DataFrame):
 
     print(f"    Inserted {len(records)} character ranking rows")
 
+
+def calculate_team_elos_pandas(
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    players_updated: pd.DataFrame,
+) -> pd.DataFrame:
+    """Calculate persisted 2v2 team ELO rows from 4-player team matches."""
+
+    ranked_player_ids = set(
+        players_updated[players_updated["top_ten_played_new"] >= 3]["id"].tolist()
+    )
+
+    print(f"    Total ranked players eligible for 2v2 ELO: {len(ranked_player_ids)}")
+
+    human_participants_df = participants_df[
+        ~participants_df["is_cpu"].fillna(False).astype(bool)
+    ].copy()
+    match_participant_counts = human_participants_df.groupby("match_id").size()
+    valid_matches = match_participant_counts[match_participant_counts == 4].index
+    valid_matches_df = matches_df[matches_df["id"].isin(valid_matches)].sort_values(
+        "created_at"
+    )
+
+    team_rows: Dict[Tuple[object, object], Dict[str, object]] = {}
+    team_elo_updates = 0
+
+    for _, match in valid_matches_df.iterrows():
+        match_id = match["id"]
+        match_participants = human_participants_df[
+            human_participants_df["match_id"] == match_id
+        ]
+
+        if len(match_participants) != 4:
+            continue
+
+        winners = match_participants[match_participants["has_won"] == True]
+        losers = match_participants[match_participants["has_won"] == False]
+
+        if len(winners) != 2 or len(losers) != 2:
+            continue
+
+        player_ids = match_participants["player"].tolist()
+        if any(player_id not in ranked_player_ids for player_id in player_ids):
+            continue
+
+        winning_team_ids = normalize_team_player_ids(
+            winners.iloc[0]["player"], winners.iloc[1]["player"]
+        )
+        losing_team_ids = normalize_team_player_ids(
+            losers.iloc[0]["player"], losers.iloc[1]["player"]
+        )
+
+        winning_row = team_rows.setdefault(
+            winning_team_ids,
+            {
+                "player_one": winning_team_ids[0],
+                "player_two": winning_team_ids[1],
+                "elo": 1200,
+                "total_wins": 0,
+                "total_losses": 0,
+                "total_kos": 0,
+                "total_falls": 0,
+                "total_sds": 0,
+                "current_win_streak": 0,
+                "last_match_date": None,
+            },
+        )
+        losing_row = team_rows.setdefault(
+            losing_team_ids,
+            {
+                "player_one": losing_team_ids[0],
+                "player_two": losing_team_ids[1],
+                "elo": 1200,
+                "total_wins": 0,
+                "total_losses": 0,
+                "total_kos": 0,
+                "total_falls": 0,
+                "total_sds": 0,
+                "current_win_streak": 0,
+                "last_match_date": None,
+            },
+        )
+
+        new_winning_elo, new_losing_elo = update_elo(
+            winning_row["elo"], losing_row["elo"], "A"
+        )
+        winning_row["elo"] = new_winning_elo
+        losing_row["elo"] = new_losing_elo
+
+        winning_row["total_wins"] += 1
+        winning_row["total_kos"] += int(winners["total_kos"].sum())
+        winning_row["total_falls"] += int(winners["total_falls"].sum())
+        winning_row["total_sds"] += int(winners["total_sds"].sum())
+        winning_row["current_win_streak"] = (
+            int(winning_row["current_win_streak"]) + 1
+        )
+        winning_row["last_match_date"] = match["created_at"]
+
+        losing_row["total_losses"] += 1
+        losing_row["total_kos"] += int(losers["total_kos"].sum())
+        losing_row["total_falls"] += int(losers["total_falls"].sum())
+        losing_row["total_sds"] += int(losers["total_sds"].sum())
+        losing_row["current_win_streak"] = 0
+        losing_row["last_match_date"] = match["created_at"]
+
+        team_elo_updates += 1
+
+    print(f"    2v2 team ELO updates applied: {team_elo_updates}")
+
+    if not team_rows:
+        return pd.DataFrame(
+            columns=[
+                "player_one",
+                "player_two",
+                "elo",
+                "total_wins",
+                "total_losses",
+                "total_kos",
+                "total_falls",
+                "total_sds",
+                "current_win_streak",
+                "last_match_date",
+            ]
+        )
+
+    return pd.DataFrame(list(team_rows.values()))
+
+
+def replace_team_rankings_in_db(team_rankings_df: pd.DataFrame):
+    """Replace the persisted 2v2 team ranking table with freshly recomputed rows."""
+    try:
+        supabase_client.table("team_rankings").delete().gte("id", 0).execute()
+    except Exception as e:
+        print(f"Error clearing team_rankings table: {e}")
+        raise
+
+    if len(team_rankings_df) == 0:
+        print("    No 2v2 team ranking rows to insert")
+        return
+
+    records = []
+    for _, row in team_rankings_df.iterrows():
+        last_match_date = row["last_match_date"]
+        if pd.isna(last_match_date):
+            last_match_date_iso = None
+        elif hasattr(last_match_date, "isoformat"):
+            last_match_date_iso = last_match_date.isoformat()
+        else:
+            last_match_date_iso = str(last_match_date)
+
+        records.append(
+            {
+                "player_one": row["player_one"],
+                "player_two": row["player_two"],
+                "elo": int(row["elo"]),
+                "total_wins": int(row["total_wins"]),
+                "total_losses": int(row["total_losses"]),
+                "total_kos": int(row["total_kos"]),
+                "total_falls": int(row["total_falls"]),
+                "total_sds": int(row["total_sds"]),
+                "current_win_streak": int(row["current_win_streak"]),
+                "last_match_date": last_match_date_iso,
+            }
+        )
+
+    batch_size = 500
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        supabase_client.table("team_rankings").insert(batch).execute()
+
+    print(f"    Inserted {len(records)} 2v2 team ranking rows")
+
 def recompute_all_player_elos_old_method():
     """Old sequential method for comparison"""
     print("="*60)
@@ -741,8 +914,16 @@ def recompute_all_player_elos():
     )
     print("\nUpdating database with character ELOs...")
     replace_character_rankings_in_db(character_rankings_df)
+
+    # Step 7: Rebuild persisted 2v2 team rankings
+    print("\nCalculating 2v2 team ELOs...")
+    team_rankings_df = calculate_team_elos_pandas(
+        matches_df, participants_df, players_with_top_ten
+    )
+    print("\nUpdating database with 2v2 team ELOs...")
+    replace_team_rankings_in_db(team_rankings_df)
     
-    # Step 7: Print final rankings (exclude 1200 ELO unranked players)
+    # Step 8: Print final rankings (exclude 1200 ELO unranked players)
     print("\n" + "="*60)
     print("FINAL ELO RANKINGS")
     print("="*60)

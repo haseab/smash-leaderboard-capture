@@ -61,6 +61,41 @@ def upsert_character_rankings(
         return False
 
 
+def _player_sort_key(player_id: Any) -> Tuple[int, Any]:
+    try:
+        return (0, int(player_id))
+    except (TypeError, ValueError):
+        return (1, str(player_id))
+
+
+def normalize_team_player_ids(player_one_id: Any, player_two_id: Any) -> Tuple[Any, Any]:
+    """Return a stable teammate order for unique team ranking rows."""
+    return tuple(sorted([player_one_id, player_two_id], key=_player_sort_key))
+
+
+def _team_lookup_key(player_one_id: Any, player_two_id: Any) -> Tuple[str, str]:
+    ordered_ids = normalize_team_player_ids(player_one_id, player_two_id)
+    return str(ordered_ids[0]), str(ordered_ids[1])
+
+
+def upsert_team_rankings(
+    rows: List[Dict[str, Any]], supabase_client: Client
+) -> bool:
+    """Upsert persisted 2v2 team ranking rows keyed by (player_one, player_two)."""
+    if not rows:
+        return True
+
+    try:
+        supabase_client.table("team_rankings").upsert(
+            rows,
+            on_conflict="player_one,player_two",
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"Error upserting team rankings: {e}")
+        return False
+
+
 def persist_match_participant_elo_diffs(
     rows: List[Dict[str, Any]], supabase_client: Client
 ) -> bool:
@@ -257,6 +292,141 @@ def update_character_rankings_for_streaming(
             "Error updating character rankings for match "
             f"{player_a_id} vs {player_b_id}: {e}"
         )
+        return None
+
+
+def update_team_rankings_for_streaming(
+    participants: List[Dict[str, Any]],
+    supabase_client: Client,
+    match_created_at: Optional[Union[datetime.datetime, str]] = None,
+    k: int = 32,
+) -> Optional[Dict[str, Any]]:
+    """
+    Persist memoized team ELO/stats for a single 2v2 match.
+
+    Team rankings only update when the match has exactly two winners, exactly
+    two losers, and all four underlying players are already ranked.
+    """
+    try:
+        if len(participants) != 4:
+            return None
+
+        winners = [participant for participant in participants if participant.get("has_won")]
+        losers = [participant for participant in participants if not participant.get("has_won")]
+
+        if len(winners) != 2 or len(losers) != 2:
+            return None
+
+        player_ids = [participant["id"] for participant in participants]
+        players_response = (
+            supabase_client.table("players")
+            .select("id, top_ten_played")
+            .in_("id", player_ids)
+            .execute()
+        )
+        players_data = {str(player["id"]): player for player in players_response.data}
+
+        if any(
+            str(player_id) not in players_data
+            or players_data[str(player_id)].get("top_ten_played", 0) < 3
+            for player_id in player_ids
+        ):
+            return None
+
+        winning_team_ids = normalize_team_player_ids(
+            winners[0]["id"], winners[1]["id"]
+        )
+        losing_team_ids = normalize_team_player_ids(losers[0]["id"], losers[1]["id"])
+        possible_team_player_ids = list(
+            {
+                winning_team_ids[0],
+                winning_team_ids[1],
+                losing_team_ids[0],
+                losing_team_ids[1],
+            }
+        )
+
+        existing_rows_response = (
+            supabase_client.table("team_rankings")
+            .select("*")
+            .in_("player_one", possible_team_player_ids)
+            .in_("player_two", possible_team_player_ids)
+            .execute()
+        )
+        existing_rows = {
+            _team_lookup_key(row["player_one"], row["player_two"]): row
+            for row in existing_rows_response.data
+        }
+
+        winning_key = _team_lookup_key(winning_team_ids[0], winning_team_ids[1])
+        losing_key = _team_lookup_key(losing_team_ids[0], losing_team_ids[1])
+        existing_winning_row = existing_rows.get(winning_key, {})
+        existing_losing_row = existing_rows.get(losing_key, {})
+
+        winning_rating = int(existing_winning_row.get("elo", 1200))
+        losing_rating = int(existing_losing_row.get("elo", 1200))
+        new_winning_rating, new_losing_rating = update_elo(
+            winning_rating, losing_rating, "A", k
+        )
+        match_created_at_iso = _coerce_match_created_at(match_created_at)
+
+        winning_totals = {
+            "kos": sum(int(participant.get("kos", 0)) for participant in winners),
+            "falls": sum(int(participant.get("falls", 0)) for participant in winners),
+            "sds": sum(int(participant.get("sds", 0)) for participant in winners),
+        }
+        losing_totals = {
+            "kos": sum(int(participant.get("kos", 0)) for participant in losers),
+            "falls": sum(int(participant.get("falls", 0)) for participant in losers),
+            "sds": sum(int(participant.get("sds", 0)) for participant in losers),
+        }
+
+        winning_row = {
+            "player_one": winning_team_ids[0],
+            "player_two": winning_team_ids[1],
+            "elo": new_winning_rating,
+            "total_wins": int(existing_winning_row.get("total_wins", 0)) + 1,
+            "total_losses": int(existing_winning_row.get("total_losses", 0)),
+            "total_kos": int(existing_winning_row.get("total_kos", 0))
+            + winning_totals["kos"],
+            "total_falls": int(existing_winning_row.get("total_falls", 0))
+            + winning_totals["falls"],
+            "total_sds": int(existing_winning_row.get("total_sds", 0))
+            + winning_totals["sds"],
+            "current_win_streak": int(
+                existing_winning_row.get("current_win_streak", 0)
+            )
+            + 1,
+            "last_match_date": match_created_at_iso,
+        }
+        losing_row = {
+            "player_one": losing_team_ids[0],
+            "player_two": losing_team_ids[1],
+            "elo": new_losing_rating,
+            "total_wins": int(existing_losing_row.get("total_wins", 0)),
+            "total_losses": int(existing_losing_row.get("total_losses", 0)) + 1,
+            "total_kos": int(existing_losing_row.get("total_kos", 0))
+            + losing_totals["kos"],
+            "total_falls": int(existing_losing_row.get("total_falls", 0))
+            + losing_totals["falls"],
+            "total_sds": int(existing_losing_row.get("total_sds", 0))
+            + losing_totals["sds"],
+            "current_win_streak": 0,
+            "last_match_date": match_created_at_iso,
+        }
+
+        if not upsert_team_rankings([winning_row, losing_row], supabase_client):
+            return None
+
+        return {
+            "winning_team": winning_row,
+            "losing_team": losing_row,
+            "old_winning_elo": winning_rating,
+            "old_losing_elo": losing_rating,
+        }
+
+    except Exception as e:
+        print(f"Error updating team rankings for 2v2 match: {e}")
         return None
 
 
