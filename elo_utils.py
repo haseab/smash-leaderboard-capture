@@ -73,9 +73,80 @@ def normalize_team_player_ids(player_one_id: Any, player_two_id: Any) -> Tuple[A
     return tuple(sorted([player_one_id, player_two_id], key=_player_sort_key))
 
 
-def _team_lookup_key(player_one_id: Any, player_two_id: Any) -> Tuple[str, str]:
+def is_solo_team_player(player_id: Any, solo_team_player_ids: set) -> bool:
+    """Return true when a player should be treated as a one-player 2v2 team."""
+    return str(player_id) in solo_team_player_ids
+
+
+def team_ranking_lookup_key(
+    player_one_id: Any,
+    player_two_id: Any,
+    solo_team_player_ids: Optional[set] = None,
+) -> Tuple[str, str]:
+    """Return the lookup key used for persisted 2v2 team ranking rows."""
+    solo_team_player_ids = solo_team_player_ids or set()
+    solo_player_ids = sorted(
+        [
+            player_id
+            for player_id in (player_one_id, player_two_id)
+            if is_solo_team_player(player_id, solo_team_player_ids)
+        ],
+        key=_player_sort_key,
+    )
+
+    if solo_player_ids:
+        solo_player_id = str(solo_player_ids[0])
+        return solo_player_id, solo_player_id
+
     ordered_ids = normalize_team_player_ids(player_one_id, player_two_id)
     return str(ordered_ids[0]), str(ordered_ids[1])
+
+
+def get_solo_team_player_ids_from_rows(player_rows: List[Dict[str, Any]]) -> set:
+    """Extract players flagged as solo 2v2 teams from database rows."""
+    return {
+        str(player_id)
+        for row in player_rows
+        for player_id in [row.get("id")]
+        if player_id is not None and row.get("solo_team", False)
+    }
+
+
+def team_players_are_ranked_for_team_elo(
+    player_ids: Tuple[Any, Any],
+    ranked_player_ids: set,
+    solo_team_player_ids: Optional[set] = None,
+) -> bool:
+    """
+    Check ranked-player eligibility for team ELO.
+
+    Solo-team players count as the whole team, so their teammate does not need
+    to be ranked for that side to be eligible.
+    """
+    solo_team_player_ids = solo_team_player_ids or set()
+
+    if any(
+        is_solo_team_player(player_id, solo_team_player_ids) for player_id in player_ids
+    ):
+        return any(
+            is_solo_team_player(player_id, solo_team_player_ids)
+            and str(player_id) in ranked_player_ids
+            for player_id in player_ids
+        )
+
+    return all(str(player_id) in ranked_player_ids for player_id in player_ids)
+
+
+def _team_lookup_key(
+    player_one_id: Any,
+    player_two_id: Any,
+    solo_team_player_ids: Optional[set] = None,
+) -> Tuple[str, str]:
+    return team_ranking_lookup_key(
+        player_one_id,
+        player_two_id,
+        solo_team_player_ids,
+    )
 
 
 def upsert_team_rankings(
@@ -305,7 +376,8 @@ def update_team_rankings_for_streaming(
     Persist memoized team ELO/stats for a single 2v2 match.
 
     Team rankings only update when the match has exactly two winners, exactly
-    two losers, and all four underlying players are already ranked.
+    two losers, the required underlying players are ranked, and both teams
+    already exist in team_rankings.
     """
     try:
         if len(participants) != 4:
@@ -320,48 +392,63 @@ def update_team_rankings_for_streaming(
         player_ids = [participant["id"] for participant in participants]
         players_response = (
             supabase_client.table("players")
-            .select("id, top_ten_played")
+            .select("id, top_ten_played, solo_team")
             .in_("id", player_ids)
             .execute()
         )
         players_data = {str(player["id"]): player for player in players_response.data}
-
-        if any(
-            str(player_id) not in players_data
-            or players_data[str(player_id)].get("top_ten_played", 0) < 3
-            for player_id in player_ids
-        ):
-            return None
+        solo_team_player_ids = get_solo_team_player_ids_from_rows(
+            players_response.data or []
+        )
+        ranked_player_ids = {
+            str(player_id)
+            for player_id, player_data in players_data.items()
+            if player_data.get("top_ten_played", 0) >= 3
+        }
 
         winning_team_ids = normalize_team_player_ids(
             winners[0]["id"], winners[1]["id"]
         )
         losing_team_ids = normalize_team_player_ids(losers[0]["id"], losers[1]["id"])
-        possible_team_player_ids = list(
-            {
-                winning_team_ids[0],
-                winning_team_ids[1],
-                losing_team_ids[0],
-                losing_team_ids[1],
-            }
-        )
+
+        if not team_players_are_ranked_for_team_elo(
+            winning_team_ids, ranked_player_ids, solo_team_player_ids
+        ) or not team_players_are_ranked_for_team_elo(
+            losing_team_ids, ranked_player_ids, solo_team_player_ids
+        ):
+            return None
 
         existing_rows_response = (
             supabase_client.table("team_rankings")
             .select("*")
-            .in_("player_one", possible_team_player_ids)
-            .in_("player_two", possible_team_player_ids)
+            .order("id")
             .execute()
         )
-        existing_rows = {
-            _team_lookup_key(row["player_one"], row["player_two"]): row
-            for row in existing_rows_response.data
-        }
+        existing_rows = {}
+        for row in existing_rows_response.data:
+            row_key = _team_lookup_key(
+                row["player_one"],
+                row["player_two"],
+                solo_team_player_ids,
+            )
+            if row_key not in existing_rows:
+                existing_rows[row_key] = row
 
-        winning_key = _team_lookup_key(winning_team_ids[0], winning_team_ids[1])
-        losing_key = _team_lookup_key(losing_team_ids[0], losing_team_ids[1])
-        existing_winning_row = existing_rows.get(winning_key, {})
-        existing_losing_row = existing_rows.get(losing_key, {})
+        winning_key = _team_lookup_key(
+            winning_team_ids[0],
+            winning_team_ids[1],
+            solo_team_player_ids,
+        )
+        losing_key = _team_lookup_key(
+            losing_team_ids[0],
+            losing_team_ids[1],
+            solo_team_player_ids,
+        )
+        existing_winning_row = existing_rows.get(winning_key)
+        existing_losing_row = existing_rows.get(losing_key)
+
+        if existing_winning_row is None or existing_losing_row is None:
+            return None
 
         winning_rating = int(existing_winning_row.get("elo", 1200))
         losing_rating = int(existing_losing_row.get("elo", 1200))
@@ -382,8 +469,8 @@ def update_team_rankings_for_streaming(
         }
 
         winning_row = {
-            "player_one": winning_team_ids[0],
-            "player_two": winning_team_ids[1],
+            "player_one": existing_winning_row["player_one"],
+            "player_two": existing_winning_row["player_two"],
             "elo": new_winning_rating,
             "total_wins": int(existing_winning_row.get("total_wins", 0)) + 1,
             "total_losses": int(existing_winning_row.get("total_losses", 0)),
@@ -400,8 +487,8 @@ def update_team_rankings_for_streaming(
             "last_match_date": match_created_at_iso,
         }
         losing_row = {
-            "player_one": losing_team_ids[0],
-            "player_two": losing_team_ids[1],
+            "player_one": existing_losing_row["player_one"],
+            "player_two": existing_losing_row["player_two"],
             "elo": new_losing_rating,
             "total_wins": int(existing_losing_row.get("total_wins", 0)),
             "total_losses": int(existing_losing_row.get("total_losses", 0)) + 1,

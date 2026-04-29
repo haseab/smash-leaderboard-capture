@@ -22,6 +22,8 @@ from elo_utils import (
     normalize_team_player_ids,
     normalize_character_name,
     persist_match_participant_elo_diffs,
+    team_players_are_ranked_for_team_elo,
+    team_ranking_lookup_key,
     update_elo,
 )
 
@@ -589,18 +591,122 @@ def replace_character_rankings_in_db(character_rankings_df: pd.DataFrame):
     print(f"    Inserted {len(records)} character ranking rows")
 
 
+def fetch_approved_team_rankings() -> List[Dict[str, object]]:
+    """Load curated 2v2 teams. These rows are the source of truth for team ELO."""
+    try:
+        approved_teams = []
+        page_size = 1000
+        start = 0
+
+        while True:
+            response = (
+                supabase_client.table("team_rankings")
+                .select("*")
+                .order("id")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            rows = response.data or []
+
+            if not rows:
+                break
+
+            approved_teams.extend(rows)
+
+            if len(rows) < page_size:
+                break
+
+            start += page_size
+
+        print(f"    Loaded {len(approved_teams)} approved 2v2 teams")
+        return approved_teams
+    except Exception as e:
+        print(f"Error fetching approved 2v2 teams: {e}")
+        raise
+
+
 def calculate_team_elos_pandas(
     matches_df: pd.DataFrame,
     participants_df: pd.DataFrame,
     players_updated: pd.DataFrame,
+    approved_team_rows: List[Dict[str, object]],
 ) -> pd.DataFrame:
-    """Calculate persisted 2v2 team ELO rows from 4-player team matches."""
+    """Calculate 2v2 team ELO rows only for teams curated in team_rankings."""
 
     ranked_player_ids = set(
-        players_updated[players_updated["top_ten_played_new"] >= 3]["id"].tolist()
+        players_updated[players_updated["top_ten_played_new"] >= 3]["id"]
+        .astype(str)
+        .tolist()
     )
 
     print(f"    Total ranked players eligible for 2v2 ELO: {len(ranked_player_ids)}")
+
+    if "solo_team" in players_updated.columns:
+        solo_team_player_ids = set(
+            players_updated[players_updated["solo_team"].fillna(False).astype(bool)][
+                "id"
+            ]
+            .astype(str)
+            .tolist()
+        )
+    else:
+        solo_team_player_ids = set()
+
+    print(f"    Solo-team players eligible for 2v2 ELO: {len(solo_team_player_ids)}")
+
+    team_rows: Dict[Tuple[str, str], Dict[str, object]] = {}
+    duplicate_approved_teams = 0
+
+    for approved_team in approved_team_rows:
+        player_one = approved_team.get("player_one")
+        player_two = approved_team.get("player_two")
+
+        if player_one is None or player_two is None:
+            continue
+
+        team_key = team_ranking_lookup_key(
+            player_one,
+            player_two,
+            solo_team_player_ids,
+        )
+        if team_key in team_rows:
+            duplicate_approved_teams += 1
+            continue
+
+        team_rows[team_key] = {
+            "id": approved_team.get("id"),
+            "player_one": player_one,
+            "player_two": player_two,
+            "elo": 1200,
+            "total_wins": 0,
+            "total_losses": 0,
+            "total_kos": 0,
+            "total_falls": 0,
+            "total_sds": 0,
+            "current_win_streak": 0,
+            "last_match_date": None,
+        }
+
+    print(f"    Approved 2v2 teams: {len(team_rows)}")
+    if duplicate_approved_teams > 0:
+        print(f"    Duplicate approved team rows skipped: {duplicate_approved_teams}")
+
+    if not team_rows:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "player_one",
+                "player_two",
+                "elo",
+                "total_wins",
+                "total_losses",
+                "total_kos",
+                "total_falls",
+                "total_sds",
+                "current_win_streak",
+                "last_match_date",
+            ]
+        )
 
     human_participants_df = participants_df[
         ~participants_df["is_cpu"].fillna(False).astype(bool)
@@ -611,8 +717,9 @@ def calculate_team_elos_pandas(
         "created_at"
     )
 
-    team_rows: Dict[Tuple[object, object], Dict[str, object]] = {}
     team_elo_updates = 0
+    unregistered_team_matches = 0
+    not_all_ranked = 0
 
     for _, match in valid_matches_df.iterrows():
         match_id = match["id"]
@@ -629,10 +736,6 @@ def calculate_team_elos_pandas(
         if len(winners) != 2 or len(losers) != 2:
             continue
 
-        player_ids = match_participants["player"].tolist()
-        if any(player_id not in ranked_player_ids for player_id in player_ids):
-            continue
-
         winning_team_ids = normalize_team_player_ids(
             winners.iloc[0]["player"], winners.iloc[1]["player"]
         )
@@ -640,36 +743,30 @@ def calculate_team_elos_pandas(
             losers.iloc[0]["player"], losers.iloc[1]["player"]
         )
 
-        winning_row = team_rows.setdefault(
-            winning_team_ids,
-            {
-                "player_one": winning_team_ids[0],
-                "player_two": winning_team_ids[1],
-                "elo": 1200,
-                "total_wins": 0,
-                "total_losses": 0,
-                "total_kos": 0,
-                "total_falls": 0,
-                "total_sds": 0,
-                "current_win_streak": 0,
-                "last_match_date": None,
-            },
+        if not team_players_are_ranked_for_team_elo(
+            winning_team_ids, ranked_player_ids, solo_team_player_ids
+        ) or not team_players_are_ranked_for_team_elo(
+            losing_team_ids, ranked_player_ids, solo_team_player_ids
+        ):
+            not_all_ranked += 1
+            continue
+
+        winning_key = team_ranking_lookup_key(
+            winning_team_ids[0],
+            winning_team_ids[1],
+            solo_team_player_ids,
         )
-        losing_row = team_rows.setdefault(
-            losing_team_ids,
-            {
-                "player_one": losing_team_ids[0],
-                "player_two": losing_team_ids[1],
-                "elo": 1200,
-                "total_wins": 0,
-                "total_losses": 0,
-                "total_kos": 0,
-                "total_falls": 0,
-                "total_sds": 0,
-                "current_win_streak": 0,
-                "last_match_date": None,
-            },
+        losing_key = team_ranking_lookup_key(
+            losing_team_ids[0],
+            losing_team_ids[1],
+            solo_team_player_ids,
         )
+        winning_row = team_rows.get(winning_key)
+        losing_row = team_rows.get(losing_key)
+
+        if winning_row is None or losing_row is None:
+            unregistered_team_matches += 1
+            continue
 
         new_winning_elo, new_losing_elo = update_elo(
             winning_row["elo"], losing_row["elo"], "A"
@@ -696,40 +793,28 @@ def calculate_team_elos_pandas(
         team_elo_updates += 1
 
     print(f"    2v2 team ELO updates applied: {team_elo_updates}")
-
-    if not team_rows:
-        return pd.DataFrame(
-            columns=[
-                "player_one",
-                "player_two",
-                "elo",
-                "total_wins",
-                "total_losses",
-                "total_kos",
-                "total_falls",
-                "total_sds",
-                "current_win_streak",
-                "last_match_date",
-            ]
-        )
+    print(f"    2v2 matches skipped (unregistered team): {unregistered_team_matches}")
+    print(f"    2v2 matches skipped (required players not ranked): {not_all_ranked}")
 
     return pd.DataFrame(list(team_rows.values()))
 
 
-def replace_team_rankings_in_db(team_rankings_df: pd.DataFrame):
-    """Replace the persisted 2v2 team ranking table with freshly recomputed rows."""
-    try:
-        supabase_client.table("team_rankings").delete().gte("id", 0).execute()
-    except Exception as e:
-        print(f"Error clearing team_rankings table: {e}")
-        raise
-
+def update_team_rankings_in_db(team_rankings_df: pd.DataFrame):
+    """Update computed fields for curated 2v2 team rows without deleting teams."""
     if len(team_rankings_df) == 0:
-        print("    No 2v2 team ranking rows to insert")
+        print("    No approved 2v2 team rows to update")
         return
 
     records = []
     for _, row in team_rankings_df.iterrows():
+        team_id = row["id"]
+        if pd.isna(team_id):
+            print(
+                "    Skipping approved 2v2 team without an id: "
+                f"{row['player_one']} / {row['player_two']}"
+            )
+            continue
+
         last_match_date = row["last_match_date"]
         if pd.isna(last_match_date):
             last_match_date_iso = None
@@ -738,27 +823,35 @@ def replace_team_rankings_in_db(team_rankings_df: pd.DataFrame):
         else:
             last_match_date_iso = str(last_match_date)
 
-        records.append(
-            {
-                "player_one": row["player_one"],
-                "player_two": row["player_two"],
-                "elo": int(row["elo"]),
-                "total_wins": int(row["total_wins"]),
-                "total_losses": int(row["total_losses"]),
-                "total_kos": int(row["total_kos"]),
-                "total_falls": int(row["total_falls"]),
-                "total_sds": int(row["total_sds"]),
-                "current_win_streak": int(row["current_win_streak"]),
-                "last_match_date": last_match_date_iso,
-            }
-        )
+        record = {
+            "id": int(team_id),
+            "player_one": row["player_one"],
+            "player_two": row["player_two"],
+            "elo": int(row["elo"]),
+            "total_wins": int(row["total_wins"]),
+            "total_losses": int(row["total_losses"]),
+            "total_kos": int(row["total_kos"]),
+            "total_falls": int(row["total_falls"]),
+            "total_sds": int(row["total_sds"]),
+            "current_win_streak": int(row["current_win_streak"]),
+            "last_match_date": last_match_date_iso,
+        }
+        records.append(record)
+
+    if not records:
+        print("    No valid approved 2v2 team rows to update")
+        return
 
     batch_size = 500
     for start in range(0, len(records), batch_size):
         batch = records[start : start + batch_size]
-        supabase_client.table("team_rankings").insert(batch).execute()
+        supabase_client.table("team_rankings").upsert(
+            batch,
+            on_conflict="id",
+        ).execute()
 
-    print(f"    Inserted {len(records)} 2v2 team ranking rows")
+    print(f"    Updated {len(records)} approved 2v2 team ranking rows")
+
 
 def recompute_all_player_elos_old_method():
     """Old sequential method for comparison"""
@@ -915,13 +1008,16 @@ def recompute_all_player_elos():
     print("\nUpdating database with character ELOs...")
     replace_character_rankings_in_db(character_rankings_df)
 
-    # Step 7: Rebuild persisted 2v2 team rankings
+    # Step 7: Recompute curated 2v2 team rankings
+    print("\nLoading approved 2v2 teams...")
+    approved_team_rows = fetch_approved_team_rankings()
+
     print("\nCalculating 2v2 team ELOs...")
     team_rankings_df = calculate_team_elos_pandas(
-        matches_df, participants_df, players_with_top_ten
+        matches_df, participants_df, players_with_top_ten, approved_team_rows
     )
     print("\nUpdating database with 2v2 team ELOs...")
-    replace_team_rankings_in_db(team_rankings_df)
+    update_team_rankings_in_db(team_rankings_df)
     
     # Step 8: Print final rankings (exclude 1200 ELO unranked players)
     print("\n" + "="*60)
