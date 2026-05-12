@@ -10,6 +10,7 @@ from enum import Enum
 import math
 import logging
 import subprocess
+import shutil
 from typing import List, Optional, Dict, Tuple
 import pandas as pd
 import pytz
@@ -101,7 +102,8 @@ class SmashBrosProcessor:
     def __init__(self, device_index=0, output_dir="matches", test_mode=False, test_video_path=None,
                  center_region_top=0.3, center_region_bottom=0.7, center_region_left=0.1, center_region_right=0.9,
                  game_region_top=0.1, game_region_bottom=0.5, game_region_left=0.2, game_region_right=0.8,
-                 consecutive_black_threshold_secs=0.5, play_video=False, video_slowdown_factor=10, rolling_window_days=30):
+                 consecutive_black_threshold_secs=0.5, play_video=False, video_slowdown_factor=10,
+                 rolling_window_days=30, min_free_space_gb=5.0):
         """
         Initialize the Smash Bros match processor
         
@@ -122,6 +124,7 @@ class SmashBrosProcessor:
             play_video: Whether to play the video in real-time (test mode only)
             video_slowdown_factor: Factor to slow down result screen videos for better API processing (default: 10)
             rolling_window_days: Number of days to keep match files. Files older than this will be automatically deleted. Default: 30 days.
+            min_free_space_gb: Minimum free disk space to keep before starting new video writes. Deletes oldest match files when below this threshold. Default: 5 GB.
         """
         self.device_index = device_index
         self.output_dir = output_dir
@@ -130,6 +133,7 @@ class SmashBrosProcessor:
         self.play_video = play_video
         self.video_slowdown_factor = video_slowdown_factor
         self.rolling_window_days = rolling_window_days
+        self.min_free_space_bytes = int(min_free_space_gb * 1024 * 1024 * 1024) if min_free_space_gb and min_free_space_gb > 0 else 0
         
         # Region boundaries (as fractions of frame dimensions)
         self.center_region_top = center_region_top
@@ -171,6 +175,7 @@ class SmashBrosProcessor:
         # Match counter
         self.match_counter = 1
         self.current_match_filepath = None
+        self.current_result_screen_filepath = None
         self.current_match_id = None  # Store database match ID
         
         # Test mode tracking
@@ -567,6 +572,18 @@ class SmashBrosProcessor:
         Start recording a new match
         """
         # Don't create match in database yet - wait until Gemini processes it and confirms it's eligible
+        has_space = self.ensure_free_disk_space(
+            "starting match recording",
+            excluded_paths=[
+                self.current_match_filepath,
+                self.current_result_screen_filepath,
+                self.current_frame_30_image_path,
+            ],
+        )
+
+        if not has_space:
+            self.logger.error("Skipping match recording because disk space is still below the configured minimum")
+            return None
         
         # Use timestamp-only filename initially (will be renamed if eligible)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -640,6 +657,104 @@ class SmashBrosProcessor:
             
             # Cleanup old matches (automatic 30-day retention)
             self.cleanup_old_matches()
+
+    def get_disk_free_bytes(self):
+        """
+        Return free bytes for the filesystem containing the output directory.
+        """
+        usage_path = self.output_dir if os.path.exists(self.output_dir) else os.path.dirname(os.path.abspath(self.output_dir))
+        return shutil.disk_usage(usage_path).free
+
+    def iter_cleanup_candidates(self, excluded_paths=None):
+        """
+        Yield old video files that are safe to delete under disk pressure.
+        """
+        excluded_paths = {os.path.abspath(path) for path in (excluded_paths or []) if path}
+        candidate_dirs = [self.output_dir, self.result_screens_dir]
+
+        for directory in candidate_dirs:
+            if not os.path.exists(directory):
+                continue
+
+            for filename in os.listdir(directory):
+                filepath = os.path.join(directory, filename)
+                absolute_path = os.path.abspath(filepath)
+
+                if absolute_path in excluded_paths:
+                    continue
+
+                if not os.path.isfile(filepath) or not filename.endswith('.mp4'):
+                    continue
+
+                try:
+                    yield {
+                        "path": filepath,
+                        "name": filename,
+                        "mtime": os.path.getmtime(filepath),
+                        "size": os.path.getsize(filepath),
+                    }
+                except OSError as e:
+                    self.logger.warning(f"Failed to inspect cleanup candidate {filename}: {e}")
+
+    def ensure_free_disk_space(self, reason="disk space check", excluded_paths=None):
+        """
+        Delete the oldest stored match videos until enough free disk space exists.
+        """
+        if self.test_mode or self.min_free_space_bytes <= 0:
+            return True
+
+        try:
+            free_bytes = self.get_disk_free_bytes()
+
+            if free_bytes >= self.min_free_space_bytes:
+                return True
+
+            target_gb = self.min_free_space_bytes / (1024 * 1024 * 1024)
+            free_gb = free_bytes / (1024 * 1024 * 1024)
+            self.logger.warning(
+                f"Low disk space before {reason}: {free_gb:.2f} GB free, target is {target_gb:.2f} GB. Deleting oldest match files."
+            )
+
+            deleted_count = 0
+            deleted_size = 0
+            candidates = sorted(
+                self.iter_cleanup_candidates(excluded_paths=excluded_paths),
+                key=lambda candidate: candidate["mtime"]
+            )
+
+            for candidate in candidates:
+                if free_bytes >= self.min_free_space_bytes:
+                    break
+
+                try:
+                    os.remove(candidate["path"])
+                    deleted_count += 1
+                    deleted_size += candidate["size"]
+                    free_bytes += candidate["size"]
+                    age_days = (datetime.datetime.now().timestamp() - candidate["mtime"]) / 86400
+                    self.logger.info(
+                        f"Deleted oldest match file under disk pressure: {candidate['name']} (age: {age_days:.1f} days)"
+                    )
+                except OSError as e:
+                    self.logger.warning(f"Failed to delete file {candidate['name']} during disk-pressure cleanup: {e}")
+
+            final_free_bytes = self.get_disk_free_bytes()
+            final_free_gb = final_free_bytes / (1024 * 1024 * 1024)
+            freed_mb = deleted_size / (1024 * 1024)
+
+            if final_free_bytes < self.min_free_space_bytes:
+                self.logger.warning(
+                    f"Disk space is still below target after cleanup: {final_free_gb:.2f} GB free. Deleted {deleted_count} file(s), freed {freed_mb:.2f} MB."
+                )
+                return False
+            elif deleted_count > 0:
+                self.logger.info(
+                    f"Disk-pressure cleanup complete: Deleted {deleted_count} file(s), freed {freed_mb:.2f} MB, {final_free_gb:.2f} GB free."
+                )
+            return True
+        except Exception as e:
+            self.logger.error(f"Error during disk-pressure cleanup: {e}")
+            return False
     
     def cleanup_old_matches(self):
         """
@@ -746,6 +861,15 @@ class SmashBrosProcessor:
         
         # Store result screen filepath for potential renaming
         self.current_result_screen_filepath = result_filepath
+
+        has_space = self.ensure_free_disk_space(
+            "writing result screen video",
+            excluded_paths=[self.current_match_filepath, result_filepath],
+        )
+
+        if not has_space:
+            self.logger.error("Skipping result screen extraction because disk space is still below the configured minimum")
+            return
         
         # Create video writer for result screens
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -889,7 +1013,9 @@ class SmashBrosProcessor:
                     self.logger.info(f"  [TEST MODE] Ready detected at: {timestamp} (Frame {self.current_frame_number}) - Confidence: {ready_confidence:.3f}")
                 
                 # Start recording immediately
-                self.start_match_recording()
+                recording_path = self.start_match_recording()
+                if not recording_path:
+                    return
                 self.game_start_frame = self.current_frame_number
                 if self.test_mode:
                     timestamp = self.format_timestamp(self.current_frame_number)
@@ -1739,6 +1865,7 @@ def main():
     
     # Rolling window arguments
     parser.add_argument('--rolling-window-days', type=int, default=30, help='Number of days to keep match files. Files older than this will be automatically deleted (default: 30). Set to 0 to disable cleanup.')
+    parser.add_argument('--min-free-space-gb', type=float, default=5.0, help='Minimum free disk space before starting new video writes. Deletes oldest match files when below this value (default: 5.0). Set to 0 to disable disk-pressure cleanup.')
     
     args = parser.parse_args()
     
@@ -1785,7 +1912,8 @@ def main():
         consecutive_black_threshold_secs=args.black_frame_threshold_secs,
         play_video=args.play_video,
         video_slowdown_factor=args.video_slowdown_factor,
-        rolling_window_days=args.rolling_window_days
+        rolling_window_days=args.rolling_window_days,
+        min_free_space_gb=args.min_free_space_gb
     )
     
     # Handle test-threshold mode
