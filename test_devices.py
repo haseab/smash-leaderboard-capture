@@ -7,6 +7,8 @@ This helps you find the correct device index for your capture card.
 import cv2
 import sys
 
+__test__ = False
+
 def test_single_device(device_index):
     """Test a single device index and display a preview window."""
     print(f"Testing device index {device_index}...")

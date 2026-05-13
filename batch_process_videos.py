@@ -19,15 +19,18 @@ import os
 import sys
 import time
 import logging
-import tempfile
 from datetime import datetime
 from typing import List, Optional
 import platform
 import re
 
-from google import genai
-from google.genai import types
-from pydantic import BaseModel
+from gemini_match_analyzer import (
+    DEFAULT_GEMINI_MODEL,
+    PlayerStats,
+    analyze_match_results_video,
+    create_gemini_client,
+    get_gemini_model,
+)
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -42,29 +45,14 @@ from elo_utils import (
 # Load environment variables
 load_dotenv()
 
-
-class PlayerStats(BaseModel):
-    is_online_match: bool
-    smash_character: str
-    player_name: str
-    is_cpu: bool
-    total_kos: int
-    total_falls: int
-    total_sds: int
-    has_won: bool
-
-
 # Initialize Gemini client
 try:
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        raise ValueError("GEMINI_API_KEY not found in environment variables")
-
-    gemini_client = genai.Client(api_key=gemini_api_key)
-    gemini_model = "gemini-3-pro-preview"
+    gemini_client = create_gemini_client()
+    gemini_model = get_gemini_model()
 except Exception as e:
     print(f"Warning: Failed to initialize Gemini client: {e}")
     gemini_client = None
+    gemini_model = DEFAULT_GEMINI_MODEL
 
 # Initialize Supabase client
 try:
@@ -298,124 +286,32 @@ class BatchVideoProcessor:
             return None
 
         try:
-            self.logger.info(f"Processing result screen video for Gemini...")
+            self.logger.info("Processing result screen video for Gemini...")
+            self.logger.info(f"Using Gemini model: {gemini_model}")
 
-            # Slow down the video
-            final_video_filepath = os.path.join(tempfile.gettempdir(), "temp_slowed_video.mp4")
-
-            # Get fps from the video
             cap = cv2.VideoCapture(result_video_path)
             fps = int(cap.get(cv2.CAP_PROP_FPS))
             if fps <= 0:
                 fps = 30
             cap.release()
 
-            ffmpeg_cmd = f"ffmpeg -y -an -i \"{result_video_path}\" -vf \"setpts={self.slowdown_factor}*PTS\" -r {fps} -map_metadata 0 \"{final_video_filepath}\" -loglevel quiet"
+            player_stats = analyze_match_results_video(
+                gemini_client,
+                result_video_path,
+                context_image_path=frame_42_path,
+                slowdown_factor=self.slowdown_factor,
+                output_fps=fps,
+                model=gemini_model,
+                logger=self.logger,
+            )
 
-            self.logger.info(f"Slowing down video by factor of {self.slowdown_factor}")
-            if os.system(ffmpeg_cmd) != 0:
-                self.logger.error("Failed to process video with ffmpeg")
+            if not player_stats:
                 return None
 
-            # Upload video file to Gemini
-            self.logger.info("Uploading video to Gemini API...")
-            video_file = gemini_client.files.upload(file=final_video_filepath)
-
-            # Wait for video file to be processed
-            while True:
-                file_info = gemini_client.files.get(name=video_file.name)
-                if file_info.state == "ACTIVE":
-                    break
-                time.sleep(1)
-
-            # Upload frame 42 image if available
-            image_file = None
-            if frame_42_path and os.path.exists(frame_42_path):
-                self.logger.info("Uploading frame 42 image for player identification...")
-                image_file = gemini_client.files.upload(file=frame_42_path)
-                while True:
-                    file_info = gemini_client.files.get(name=image_file.name)
-                    if file_info.state == "ACTIVE":
-                        break
-                    time.sleep(1)
-
-            # Build prompt
-            if image_file:
-                frame_note = "\n\nIMPORTANT: I've also included a frame captured at 42 frames (~1.4 seconds) into the match recording. This frame shows the character select screen or early game screen which displays player names clearly. Use this image to help identify the player names, as players often click through the result screen menu too quickly.\n"
-            else:
-                frame_note = ""
-
-            prompt_text = """Here is a video recording of the results screen of a super smash bros ultimate match.""" + frame_note + """
-
-Output the following information about the game's results as valid json following this schema (where it's a list of json objects -- one for each player in the match):
-
-```
-[
-{
-\"smash_character\" : string,
-\"player_name\" : string,
-\"is_cpu\" : boolean,
-\"total_kos\" : int,
-\"total_falls\" : int (positive integer, even if it shows negative),
-\"total_sds\" : int,
-\"has_won\" : boolean,
-\"is_online_match\" : boolean,
-},
-...
-]
-```
-
-keep the following in mind:
-- player names are listed BESIDE P1, P2, P3, etc and under the actual smash character name. Note, Player Names are NOT P1, P2, P3, etc. Examples of player names: habeas, shafaq, jmoon, subby, keneru, kento etc. Note: Player names are not the same as the smash character name. Zelda, Joker, Lucina, Donkey Kong are smash character names, not player names. Player names are the people playing the game.
-- the total number of KOs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"KOs\" label, then instead, the KO's are counted by counting the number of mini character icons shown under the \"KOs\" section of the character card
-- total number of falls is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"Falls\" label, then instead, the falls are counted by counting the number of mini character icons shown under the \"Falls\" section of the character card
-- total number of SDs is an integer number located to the right of the label, and cannot be null. if you can't see a number next to the \"SDs\" label, then instead, the SD's are counted by counting the number of mini character icons shown under the \"SDs\" section of the character card
-- \"has_won\" denotes whether or not the character won (labeled with a gold-colored number 1 at the top right of the player card. if there is no such number ranking on the top right, then the character did not win; for \"no contest\" matches, no character wins)
-- \"is_online_match\" There are likely to be 2 players in the match. If you see "onlineacc" as one of the player names, then return true, otherwise it is an offline match. If the player name is not "onlineacc" or "offlineacc", return false.
-- If all people playing the game have a player name, then is_cpu must be false. If is_cpu is false, then it's impossible to have only 1 player in the match. Really make sure that you have identified all the players in the match. is_cpu is ONLY TRUE if it says "CPU" on the player card. Otherwise, it is false.
-- If you see "mmmmm" as a player name, the player name has 5 'm's as letters. Not more not less.
-- Sometimes the rectangular player card does not show the KO's, Falls, or SD's, but instead shows "READY FOR THE NEXT BATTLE". In this case, set the player name to "unknown" (all in lowercase), with 0 for the total number of KOs, Falls, and SDs and not cpu and not online and not has_won and smash character also as "unknown".
-"""
-
-            # Build contents array
-            contents = []
-            if image_file:
-                contents.append(image_file)
-            contents.append(video_file)
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=prompt_text)],
-                ),
-            )
-
-            self.logger.info("Analyzing video with Gemini API...")
-            response = gemini_client.models.generate_content(
-                model=gemini_model,
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',
-                    response_schema=list[PlayerStats],
-                ),
-                contents=contents,
-            )
-
-            # Clean up uploaded files
-            gemini_client.files.delete(name=video_file.name)
-            if image_file:
-                gemini_client.files.delete(name=image_file.name)
-
-            # Clean up temporary video file
-            try:
-                os.remove(final_video_filepath)
-            except:
-                pass
-
-            self.logger.info(f"Successfully extracted stats for {len(response.parsed)} players")
-
-            for i, stat in enumerate(response.parsed):
+            for i, stat in enumerate(player_stats):
                 self.logger.info(f"Player {i+1}: {stat.player_name} ({stat.smash_character}) - KOs: {stat.total_kos}, Falls: {stat.total_falls}, SDs: {stat.total_sds}, Won: {stat.has_won}")
 
-            return response.parsed
+            return player_stats
 
         except Exception as e:
             self.logger.error(f"Error extracting match stats: {e}")
