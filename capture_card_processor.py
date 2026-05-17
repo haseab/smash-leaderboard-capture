@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import argparse
+import json
 from enum import Enum
 import math
 import logging
@@ -195,7 +196,7 @@ class SmashBrosProcessor:
         self.result_screens_dir = os.path.join(output_dir, "result_screens")
         if not os.path.exists(self.result_screens_dir):
             os.makedirs(self.result_screens_dir)
-        
+
         # Store Supabase client as instance variable
         self.supabase_client = supabase_client
         
@@ -782,13 +783,13 @@ class SmashBrosProcessor:
                     except OSError as e:
                         self.logger.warning(f"Failed to delete file {filename}: {e}")
             
-            # Clean up result screen files
+            # Clean up result screen artifacts
             if os.path.exists(self.result_screens_dir):
                 for filename in os.listdir(self.result_screens_dir):
                     filepath = os.path.join(self.result_screens_dir, filename)
-                    # Skip directories and non-mp4 files
-                    if not os.path.isfile(filepath) or not filename.endswith('.mp4'):
+                    if not os.path.isfile(filepath):
                         continue
+
                     try:
                         file_mtime = os.path.getmtime(filepath)
                         if file_mtime < cutoff_timestamp:
@@ -796,10 +797,10 @@ class SmashBrosProcessor:
                             os.remove(filepath)
                             deleted_count += 1
                             deleted_size += file_size
-                            self.logger.info(f"Deleted old result screen file: {filename} (age: {(datetime.datetime.now().timestamp() - file_mtime) / 86400:.1f} days)")
+                            self.logger.info(f"Deleted old result screen artifact: {filename} (age: {(datetime.datetime.now().timestamp() - file_mtime) / 86400:.1f} days)")
                     except OSError as e:
                         self.logger.warning(f"Failed to delete file {filename}: {e}")
-            
+
             if deleted_count > 0:
                 size_mb = deleted_size / (1024 * 1024)
                 self.logger.info(f"Cleanup complete: Deleted {deleted_count} file(s), freed {size_mb:.2f} MB")
@@ -808,6 +809,93 @@ class SmashBrosProcessor:
                 
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
+
+    def save_result_screen_debug_artifacts(self, result_frames, best_frame_index, best_confidence, reason):
+        """
+        Save enough context to inspect result-screen detections that were too short
+        for normal Gemini processing.
+        """
+        if not result_frames:
+            return None
+
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = f"{timestamp}_result_screen"
+            video_path = os.path.join(self.result_screens_dir, f"{base_name}.mp4")
+
+            has_space = self.ensure_free_disk_space(
+                "writing result screen diagnostic",
+                excluded_paths=[self.current_match_filepath, video_path],
+            )
+
+            if not has_space:
+                self.logger.error("Skipping result screen diagnostic because disk space is still below the configured minimum")
+                return None
+
+            result_fps = self.get_result_screen_output_fps()
+            height, width = result_frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(video_path, fourcc, result_fps, (width, height))
+
+            if out.isOpened():
+                for frame in result_frames:
+                    out.write(frame)
+                out.release()
+            else:
+                self.logger.warning(f"Failed to create result screen diagnostic video writer for {video_path}")
+                video_path = None
+
+            frame_42_path = None
+            if self.frame_30_image is not None:
+                frame_42_path = os.path.join(self.result_screens_dir, f"{base_name}_frame_42.png")
+                cv2.imwrite(frame_42_path, self.frame_30_image)
+
+            manifest_path = os.path.join(self.result_screens_dir, f"{base_name}_debug.json")
+            manifest = {
+                "reason": reason,
+                "created_at": datetime.datetime.now().isoformat(),
+                "frame_count": len(result_frames),
+                "minimum_required_frames": self.get_min_result_screen_frames(),
+                "source_fps": self.fps,
+                "output_fps": result_fps,
+                "frame_skip_interval": self.frame_skip_interval,
+                "duration_seconds": len(result_frames) / result_fps if result_fps > 0 else None,
+                "best_frame_index": int(best_frame_index),
+                "best_confidence": float(best_confidence),
+                "recording_frame_count": len(self.recording_frames),
+                "current_frame_number": self.current_frame_number,
+                "current_match_filepath": self.current_match_filepath,
+                "video_path": video_path,
+                "frame_42_path": frame_42_path,
+                "game_end_confidence_threshold": self.game_end_confidence_threshold,
+            }
+
+            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(manifest, manifest_file, indent=2)
+
+            self.logger.warning(
+                f"Saved result screen diagnostic artifacts: {os.path.basename(video_path) if video_path else 'video unavailable'}, {os.path.basename(manifest_path)}"
+            )
+            return manifest_path
+        except Exception as e:
+            self.logger.error(f"Failed to save result screen diagnostic: {e}")
+            return None
+
+    def get_result_screen_output_fps(self):
+        """
+        Result frames are sampled every frame_skip_interval frames. Write clips at
+        the effective FPS so the saved result-screen video reflects real time.
+        """
+        if self.fps <= 0:
+            return 30
+
+        return max(1, self.fps / max(1, self.frame_skip_interval))
+
+    def get_min_result_screen_frames(self):
+        """
+        Require about 0.5 seconds of result-screen footage after downsampling.
+        """
+        return max(1, math.ceil(0.5 * self.get_result_screen_output_fps()))
     
     def extract_result_screens(self):
         """
@@ -838,8 +926,17 @@ class SmashBrosProcessor:
         # Extract frames from the best frame to the end
         result_frames = self.recording_frames[best_frame_index:]
         
-        if len(result_frames) < 30:  # Less than 0.5 seconds at 60fps
-            self.logger.warning(f"Result screen sequence too short ({len(result_frames)} frames), skipping")
+        min_result_screen_frames = self.get_min_result_screen_frames()
+        if len(result_frames) < min_result_screen_frames:
+            self.logger.warning(
+                f"Result screen sequence too short ({len(result_frames)} frames, minimum {min_result_screen_frames}), skipping"
+            )
+            self.save_result_screen_debug_artifacts(
+                result_frames,
+                best_frame_index,
+                best_confidence,
+                reason=f"result screen sequence too short ({len(result_frames)} frames, minimum {min_result_screen_frames})",
+            )
             return
         
         # Create result screen video filename
@@ -862,7 +959,8 @@ class SmashBrosProcessor:
         
         # Create video writer for result screens
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        result_out = cv2.VideoWriter(result_filepath, fourcc, self.fps, (self.width, self.height))
+        result_fps = self.get_result_screen_output_fps()
+        result_out = cv2.VideoWriter(result_filepath, fourcc, result_fps, (self.width, self.height))
         
         if not result_out.isOpened():
             self.logger.warning(f"Failed to create result screen video writer for {result_filepath}")
@@ -885,10 +983,11 @@ class SmashBrosProcessor:
             self.logger.info(f"Saved frame 42 image: {os.path.basename(frame_30_image_path)}")
         
         # Calculate duration
-        duration_seconds = len(result_frames) / self.fps if self.fps > 0 else 0
+        duration_seconds = len(result_frames) / result_fps if result_fps > 0 else 0
         
         self.logger.info(f"Saved result screens: {result_filename}")
         self.logger.info(f"  Duration: {duration_seconds:.2f} seconds ({len(result_frames)} frames)")
+        self.logger.info(f"  Output FPS: {result_fps:.2f} (source FPS: {self.fps}, frame skip: {self.frame_skip_interval})")
         self.logger.info(f"  Starting from frame with confidence: {best_confidence:.3f}")
         self.logger.info(f"  Frame index in match: {best_frame_index}/{len(self.recording_frames)-1}")
         

@@ -14,6 +14,8 @@ Usage:
 
 import argparse
 import cv2
+import json
+import math
 import numpy as np
 import os
 import sys
@@ -103,6 +105,7 @@ class BatchVideoProcessor:
         self.processed_count = 0
         self.skipped_count = 0
         self.failed_count = 0
+        self.frame_skip_interval = 2
 
         # Detection parameters (from capture_card_processor.py)
         self.game_end_confidence_threshold = 0.7
@@ -162,6 +165,81 @@ class BatchVideoProcessor:
             self.logger.error(f"Error in detect_game_end: {e}")
             return 0.0, False
 
+    def get_result_screen_output_fps(self, source_fps: int) -> float:
+        """Return the effective FPS after result-frame downsampling."""
+        if source_fps <= 0:
+            source_fps = 30
+
+        return max(1, source_fps / max(1, self.frame_skip_interval))
+
+    def get_min_result_screen_frames(self, source_fps: int) -> int:
+        """Require about 0.5 seconds of result-screen footage after downsampling."""
+        return max(1, math.ceil(0.5 * self.get_result_screen_output_fps(source_fps)))
+
+    def save_result_screen_debug_artifacts(
+        self,
+        source_video_path: str,
+        result_frames: List,
+        frame_42_image,
+        fps: int,
+        best_frame_index: int,
+        best_confidence: float,
+        reason: str,
+    ) -> Optional[str]:
+        """Save result-screen artifacts for debugging failed extraction."""
+        if not result_frames:
+            return None
+
+        try:
+            source_base = os.path.splitext(os.path.basename(source_video_path))[0]
+            base_name = f"{source_base}_result_screen"
+            video_path = os.path.join(self.result_screens_dir, f"{base_name}.mp4")
+            output_fps = self.get_result_screen_output_fps(fps)
+
+            height, width = result_frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(video_path, fourcc, output_fps, (width, height))
+
+            if out.isOpened():
+                for frame in result_frames:
+                    out.write(frame)
+                out.release()
+            else:
+                self.logger.warning(f"Failed to create result screen diagnostic video writer for {video_path}")
+                video_path = None
+
+            frame_42_path = None
+            if frame_42_image is not None:
+                frame_42_path = os.path.join(self.result_screens_dir, f"{base_name}_frame_42.png")
+                cv2.imwrite(frame_42_path, frame_42_image)
+
+            manifest_path = os.path.join(self.result_screens_dir, f"{base_name}_debug.json")
+            manifest = {
+                "reason": reason,
+                "created_at": datetime.now().isoformat(),
+                "source_video_path": source_video_path,
+                "frame_count": len(result_frames),
+                "minimum_required_frames": self.get_min_result_screen_frames(fps),
+                "source_fps": fps,
+                "output_fps": output_fps,
+                "frame_skip_interval": self.frame_skip_interval,
+                "duration_seconds": len(result_frames) / output_fps if output_fps > 0 else None,
+                "best_frame_index": best_frame_index,
+                "best_confidence": float(best_confidence),
+                "video_path": video_path,
+                "frame_42_path": frame_42_path,
+                "game_end_confidence_threshold": self.game_end_confidence_threshold,
+            }
+
+            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(manifest, manifest_file, indent=2)
+
+            self.logger.warning(f"Saved result screen diagnostic artifacts: {video_path}, {manifest_path}")
+            return manifest_path
+        except Exception as e:
+            self.logger.error(f"Failed to save result screen diagnostic: {e}")
+            return None
+
     def extract_result_screen(self, video_path: str) -> tuple:
         """
         Extract the result screen portion from a full match video.
@@ -189,7 +267,6 @@ class BatchVideoProcessor:
         scores = []
         frame_42_image = None
         frame_count = 0
-        frame_skip_interval = 2  # Store every 2nd frame
         max_frames = 3600  # ~1 minute at 60fps
 
         while True:
@@ -208,7 +285,7 @@ class BatchVideoProcessor:
             confidence, _ = self.detect_game_end(frame)
 
             # Store every nth frame
-            if frame_count % frame_skip_interval == 0:
+            if frame_count % self.frame_skip_interval == 0:
                 frames.append(frame.copy())
                 scores.append(confidence)
 
@@ -246,8 +323,20 @@ class BatchVideoProcessor:
         # Extract frames from the best frame to the end
         result_frames = frames[best_frame_index:]
 
-        if len(result_frames) < 15:  # Less than ~0.5 seconds
-            self.logger.warning(f"Result screen sequence too short ({len(result_frames)} frames)")
+        min_result_screen_frames = self.get_min_result_screen_frames(fps)
+        if len(result_frames) < min_result_screen_frames:
+            self.logger.warning(
+                f"Result screen sequence too short ({len(result_frames)} frames, minimum {min_result_screen_frames})"
+            )
+            self.save_result_screen_debug_artifacts(
+                video_path,
+                result_frames,
+                frame_42_image,
+                fps,
+                best_frame_index,
+                best_confidence,
+                reason=f"result screen sequence too short ({len(result_frames)} frames, minimum {min_result_screen_frames})",
+            )
             return None, None, None
 
         self.logger.info(f"Extracted {len(result_frames)} result screen frames (confidence: {best_confidence:.3f})")
@@ -266,7 +355,8 @@ class BatchVideoProcessor:
 
         height, width = frames[0].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
+        output_fps = self.get_result_screen_output_fps(fps)
+        out = cv2.VideoWriter(result_path, fourcc, output_fps, (width, height))
 
         if not out.isOpened():
             self.logger.error("Failed to create video writer")
@@ -277,6 +367,7 @@ class BatchVideoProcessor:
 
         out.release()
         self.logger.info(f"Saved result screen video: {result_filename}")
+        self.logger.info(f"  Output FPS: {output_fps:.2f} (source FPS: {fps}, frame skip: {self.frame_skip_interval})")
         return result_path
 
     def get_match_stats(self, result_video_path: str, frame_42_path: Optional[str] = None) -> Optional[List[PlayerStats]]:
