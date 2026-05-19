@@ -37,6 +37,8 @@ from youtube_uploader import upload_video
 # Load environment variables from .env file
 load_dotenv()
 
+DEFAULT_OUTPUT_DIR = os.path.join("local", "matches")
+
 class GameState(Enum):
     WAITING = "waiting"
     READY_DETECTED = "ready_detected"
@@ -89,7 +91,7 @@ def invalidate_frontend_cache():
 
 
 class SmashBrosProcessor:
-    def __init__(self, device_index=0, output_dir="matches", test_mode=False, test_video_path=None,
+    def __init__(self, device_index=0, output_dir=DEFAULT_OUTPUT_DIR, test_mode=False, test_video_path=None,
                  center_region_top=0.3, center_region_bottom=0.7, center_region_left=0.1, center_region_right=0.9,
                  game_region_top=0.1, game_region_bottom=0.5, game_region_left=0.2, game_region_right=0.8,
                  consecutive_black_threshold_secs=0.5, play_video=False, video_slowdown_factor=10,
@@ -117,7 +119,7 @@ class SmashBrosProcessor:
             min_free_space_gb: Minimum free disk space to keep before starting new video writes. Deletes oldest match files when below this threshold. Default: 5 GB.
         """
         self.device_index = device_index
-        self.output_dir = output_dir
+        self.output_dir = os.path.normpath(output_dir)
         self.test_mode = test_mode
         self.test_video_path = test_video_path
         self.play_video = play_video
@@ -189,11 +191,11 @@ class SmashBrosProcessor:
         self.current_frame_30_image_path = None  # Path to saved frame 42 image file
         
         # Create output directory
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
         
         # Create result screens directory
-        self.result_screens_dir = os.path.join(output_dir, "result_screens")
+        self.result_screens_dir = os.path.join(self.output_dir, "result_screens")
         if not os.path.exists(self.result_screens_dir):
             os.makedirs(self.result_screens_dir)
 
@@ -1846,7 +1848,7 @@ def main():
     parser.add_argument('--play-video', action='store_true', help='Play video in real-time during test mode (default: fast offline processing)')
     parser.add_argument('--test-threshold', type=str, help='Test detection thresholds at specific timestamp (mm:ss or hh:mm:ss format)')
     parser.add_argument('--device', type=int, default=0, help='Capture device index (default: 0)')
-    parser.add_argument('--output', type=str, default='matches', help='Output directory (default: matches)')
+    parser.add_argument('--output', type=str, default=DEFAULT_OUTPUT_DIR, help=f'Output directory (default: {DEFAULT_OUTPUT_DIR})')
     
     # Region boundary arguments
     parser.add_argument('--center-region-top', type=float, default=0.3, help='Top boundary for center region (0.0-1.0, default: 0.3)')
