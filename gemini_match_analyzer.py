@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import subprocess
 import tempfile
 import time
@@ -23,8 +22,7 @@ DEFAULT_UPLOAD_TIMEOUT_SECONDS = 300
 DEFAULT_RESULT_STILL_COUNT = 4
 DEFAULT_FILE_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_GEMINI_MAX_RETRIES = 5
-DEFAULT_GEMINI_RETRY_BASE_DELAY_SECONDS = 60
-DEFAULT_GEMINI_RETRY_MAX_DELAY_SECONDS = 300
+DEFAULT_GEMINI_RETRY_DELAY_SECONDS = 300
 
 
 class GeminiPlayerStats(BaseModel):
@@ -456,46 +454,18 @@ def _exception_details(exc: Exception) -> str:
     return json.dumps(details, default=str, ensure_ascii=True)
 
 
-def _generate_content_with_retry(
+def _generate_content(
     client,
     *,
     model: str,
     config,
     contents,
-    max_retries: int,
-    base_delay_seconds: int,
-    max_delay_seconds: int,
-    logger=None,
 ):
-    attempt = 0
-    while True:
-        try:
-            return client.models.generate_content(
-                model=model,
-                config=config,
-                contents=contents,
-            )
-        except Exception as exc:
-            if not _is_rate_limit_error(exc) or attempt >= max_retries:
-                if _is_rate_limit_error(exc):
-                    _log(
-                        logger,
-                        "warning",
-                        f"Gemini rate limit failed after {attempt} retries. "
-                        f"Details: {_exception_details(exc)}",
-                    )
-                raise
-
-            delay = min(max_delay_seconds, base_delay_seconds * (2 ** attempt))
-            delay += random.uniform(0, min(10.0, delay * 0.1))
-            attempt += 1
-            _log(
-                logger,
-                "warning",
-                f"Gemini rate limit hit; retrying in {delay:.1f}s "
-                f"(attempt {attempt}/{max_retries}). Details: {_exception_details(exc)}",
-            )
-            time.sleep(delay)
+    return client.models.generate_content(
+        model=model,
+        config=config,
+        contents=contents,
+    )
 
 
 def _to_downstream_player_stats(match_stats: GeminiMatchStats) -> List[PlayerStats]:
@@ -530,8 +500,7 @@ def analyze_match_results_video(
     result_still_count = _env_int("GEMINI_RESULT_STILL_COUNT", DEFAULT_RESULT_STILL_COUNT)
     file_poll_interval = _env_float("GEMINI_FILE_POLL_INTERVAL_SECONDS", DEFAULT_FILE_POLL_INTERVAL_SECONDS)
     max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)
-    retry_base_delay = _env_int("GEMINI_RETRY_BASE_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_BASE_DELAY_SECONDS)
-    retry_max_delay = _env_int("GEMINI_RETRY_MAX_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_MAX_DELAY_SECONDS)
+    retry_delay = _env_int("GEMINI_RETRY_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_DELAY_SECONDS)
 
     uploaded_files = []
 
@@ -597,36 +566,55 @@ def analyze_match_results_video(
 
             models_to_try = _ordered_models(model)
             response = None
-            for model_index, candidate_model in enumerate(models_to_try):
-                _log(
-                    logger,
-                    "info",
-                    f"Analyzing result screen with {candidate_model}, "
-                    f"media_resolution=HIGH, video_sample_fps={video_sample_fps}.",
-                )
-                try:
-                    response = _generate_content_with_retry(
-                        client,
-                        model=candidate_model,
-                        config=_build_generate_config(),
-                        contents=types.Content(role="user", parts=parts),
-                        max_retries=max_retries,
-                        base_delay_seconds=retry_base_delay,
-                        max_delay_seconds=retry_max_delay,
-                        logger=logger,
-                    )
-                    if candidate_model != model:
-                        _log(logger, "info", f"Gemini fallback model succeeded: {candidate_model}")
-                    break
-                except Exception as exc:
-                    if not _is_rate_limit_error(exc) or model_index == len(models_to_try) - 1:
-                        raise
-                    next_model = models_to_try[model_index + 1]
+            last_rate_limit_error = None
+            for retry_attempt in range(max_retries + 1):
+                for candidate_model in models_to_try:
                     _log(
                         logger,
-                        "warning",
-                        f"Gemini model {candidate_model} is rate limited; trying fallback model {next_model}.",
+                        "info",
+                        f"Analyzing result screen with {candidate_model}, "
+                        f"media_resolution=HIGH, video_sample_fps={video_sample_fps}.",
                     )
+                    try:
+                        response = _generate_content(
+                            client,
+                            model=candidate_model,
+                            config=_build_generate_config(),
+                            contents=types.Content(role="user", parts=parts),
+                        )
+                        if candidate_model != model:
+                            _log(logger, "info", f"Gemini fallback model succeeded: {candidate_model}")
+                        break
+                    except Exception as exc:
+                        if not _is_rate_limit_error(exc):
+                            raise
+                        last_rate_limit_error = exc
+                        _log(
+                            logger,
+                            "warning",
+                            f"Gemini model {candidate_model} is rate limited. "
+                            f"Details: {_exception_details(exc)}",
+                        )
+
+                if response is not None:
+                    break
+
+                if retry_attempt >= max_retries:
+                    _log(
+                        logger,
+                        "error",
+                        f"All Gemini models were rate limited after {retry_attempt + 1} full pass(es). "
+                        f"Details: {_exception_details(last_rate_limit_error)}",
+                    )
+                    raise last_rate_limit_error
+
+                _log(
+                    logger,
+                    "warning",
+                    f"All Gemini models were rate limited; waiting {retry_delay}s before retrying "
+                    f"the full model chain (retry {retry_attempt + 1}/{max_retries}).",
+                )
+                time.sleep(retry_delay)
 
             if response is None:
                 raise RuntimeError("Gemini did not return a response from any configured model")
