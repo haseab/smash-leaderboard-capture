@@ -98,10 +98,17 @@ def get_video_files(directory: str) -> List[str]:
 
 
 class BatchVideoProcessor:
-    def __init__(self, directory: str, slowdown_factor: int = 10, dry_run: bool = False):
+    def __init__(
+        self,
+        directory: str,
+        slowdown_factor: int = 10,
+        dry_run: bool = False,
+        api_delay_seconds: float = 60.0,
+    ):
         self.directory = directory
         self.slowdown_factor = slowdown_factor
         self.dry_run = dry_run
+        self.api_delay_seconds = max(0.0, api_delay_seconds)
         self.processed_count = 0
         self.skipped_count = 0
         self.failed_count = 0
@@ -739,9 +746,11 @@ class BatchVideoProcessor:
                 self.logger.error(f"Error processing {video_path}: {e}")
                 self.failed_count += 1
 
-            # Small delay between API calls to avoid rate limiting
-            if not self.dry_run and i < len(video_files):
-                time.sleep(2)
+            if not self.dry_run and i < len(video_files) and self.api_delay_seconds > 0:
+                self.logger.info(
+                    f"Waiting {self.api_delay_seconds:.1f}s before next video to avoid Gemini rate limits."
+                )
+                time.sleep(self.api_delay_seconds)
 
         # Print summary
         self.logger.info("\n" + "=" * 60)
@@ -758,6 +767,7 @@ def main():
     parser.add_argument('directory', type=str, help='Path to directory containing video files')
     parser.add_argument('--slowdown', type=int, default=10, help='Video slowdown factor for Gemini (default: 10)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be processed without actually processing')
+    parser.add_argument('--api-delay', type=float, default=60.0, help='Seconds to wait between videos to avoid Gemini rate limits (default: 60)')
 
     args = parser.parse_args()
 
@@ -765,7 +775,7 @@ def main():
         print(f"Error: Directory not found: {args.directory}")
         sys.exit(1)
 
-    processor = BatchVideoProcessor(args.directory, args.slowdown, args.dry_run)
+    processor = BatchVideoProcessor(args.directory, args.slowdown, args.dry_run, args.api_delay)
     processor.process_all()
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import subprocess
 import tempfile
 import time
@@ -15,6 +16,9 @@ DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_VIDEO_SAMPLE_FPS = 4.0
 DEFAULT_UPLOAD_TIMEOUT_SECONDS = 300
 DEFAULT_RESULT_STILL_COUNT = 4
+DEFAULT_GEMINI_MAX_RETRIES = 5
+DEFAULT_GEMINI_RETRY_BASE_DELAY_SECONDS = 60
+DEFAULT_GEMINI_RETRY_MAX_DELAY_SECONDS = 300
 
 
 class GeminiPlayerStats(BaseModel):
@@ -370,6 +374,54 @@ def _parse_response(response) -> GeminiMatchStats:
         return GeminiMatchStats.model_validate(json.loads(text))
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status = getattr(exc, "status", "")
+    code = getattr(exc, "code", None)
+    message = str(exc)
+    return (
+        code == 429
+        or str(status).upper() == "RESOURCE_EXHAUSTED"
+        or "429" in message
+        or "RESOURCE_EXHAUSTED" in message
+        or "Too Many Requests" in message
+    )
+
+
+def _generate_content_with_retry(
+    client,
+    *,
+    model: str,
+    config,
+    contents,
+    max_retries: int,
+    base_delay_seconds: int,
+    max_delay_seconds: int,
+    logger=None,
+):
+    attempt = 0
+    while True:
+        try:
+            return client.models.generate_content(
+                model=model,
+                config=config,
+                contents=contents,
+            )
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                raise
+
+            delay = min(max_delay_seconds, base_delay_seconds * (2 ** attempt))
+            delay += random.uniform(0, min(10.0, delay * 0.1))
+            attempt += 1
+            _log(
+                logger,
+                "warning",
+                f"Gemini rate limit hit; retrying in {delay:.1f}s "
+                f"(attempt {attempt}/{max_retries}).",
+            )
+            time.sleep(delay)
+
+
 def _to_downstream_player_stats(match_stats: GeminiMatchStats) -> List[PlayerStats]:
     return [
         PlayerStats(
@@ -400,6 +452,9 @@ def analyze_match_results_video(
     video_sample_fps = _env_float("GEMINI_VIDEO_SAMPLE_FPS", DEFAULT_VIDEO_SAMPLE_FPS)
     timeout_seconds = _env_int("GEMINI_UPLOAD_TIMEOUT_SECONDS", DEFAULT_UPLOAD_TIMEOUT_SECONDS)
     result_still_count = _env_int("GEMINI_RESULT_STILL_COUNT", DEFAULT_RESULT_STILL_COUNT)
+    max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)
+    retry_base_delay = _env_int("GEMINI_RETRY_BASE_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_BASE_DELAY_SECONDS)
+    retry_max_delay = _env_int("GEMINI_RETRY_MAX_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_MAX_DELAY_SECONDS)
 
     uploaded_files = []
 
@@ -450,10 +505,15 @@ def analyze_match_results_video(
                 "info",
                 f"Analyzing result screen with {model}, media_resolution=HIGH, video_sample_fps={video_sample_fps}.",
             )
-            response = client.models.generate_content(
+            response = _generate_content_with_retry(
+                client,
                 model=model,
                 config=_build_generate_config(),
                 contents=types.Content(role="user", parts=parts),
+                max_retries=max_retries,
+                base_delay_seconds=retry_base_delay,
+                max_delay_seconds=retry_max_delay,
+                logger=logger,
             )
 
             match_stats = _parse_response(response)
