@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import List, Optional
 import platform
 import re
+import requests
 
 from gemini_match_analyzer import (
     DEFAULT_GEMINI_MODEL,
@@ -70,6 +71,38 @@ except Exception as e:
     supabase_client = None
 
 
+def invalidate_frontend_cache(logger=None):
+    """Invalidate frontend caches after batch saves update leaderboard data."""
+    frontend_urls = [
+        url.strip()
+        for url in os.getenv("FRONTEND_URLS", os.getenv("FRONTEND_URL", "")).split(",")
+        if url.strip()
+    ]
+
+    if not frontend_urls:
+        message = "FRONTEND_URL not set, skipping cache invalidation"
+        logger.warning(message) if logger else print(message)
+        return
+
+    tags = ["players", "matches"]
+    for frontend_url in frontend_urls:
+        try:
+            response = requests.get(
+                f"{frontend_url.rstrip('/')}/api/revalidate",
+                params={"tags": ",".join(tags)},
+                timeout=10,
+            )
+            if response.ok:
+                message = f"Frontend cache invalidated for {frontend_url}: {response.json()}"
+                logger.info(message) if logger else print(message)
+            else:
+                message = f"Failed to invalidate cache for {frontend_url}: {response.status_code} - {response.text}"
+                logger.warning(message) if logger else print(message)
+        except Exception as e:
+            message = f"Failed to invalidate frontend cache for {frontend_url}: {e}"
+            logger.warning(message) if logger else print(message)
+
+
 def get_file_creation_time(filepath: str) -> datetime:
     """Get the creation time of a file, cross-platform."""
     if platform.system() == 'Windows':
@@ -81,7 +114,14 @@ def get_file_creation_time(filepath: str) -> datetime:
         else:
             timestamp = stat.st_mtime
 
-    return datetime.fromtimestamp(timestamp)
+    return datetime.fromtimestamp(timestamp).astimezone()
+
+
+def format_db_timestamp(value: datetime) -> str:
+    """Serialize datetimes with an explicit timezone for timestamptz columns."""
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value.isoformat()
 
 
 def get_video_files(directory: str) -> List[str]:
@@ -447,7 +487,7 @@ class BatchVideoProcessor:
             return None
 
         try:
-            created_at_iso = created_at.isoformat()
+            created_at_iso = format_db_timestamp(created_at)
             response = (
                 supabase_client.table("matches")
                 .insert({"created_at": created_at_iso})
@@ -514,7 +554,7 @@ class BatchVideoProcessor:
                     "total_sds": stat.total_sds,
                     "has_won": stat.has_won,
                     "match_id": match_id,
-                    "created_at": created_at.isoformat(),
+                    "created_at": format_db_timestamp(created_at),
                 }).execute()
 
                 players.append({
@@ -662,6 +702,8 @@ class BatchVideoProcessor:
             # Update inactivity status for all players
             self.logger.info("Updating inactivity status...")
             update_inactivity_status(supabase_client)
+
+            invalidate_frontend_cache(self.logger)
 
             self.logger.info("=" * 60)
             return True
