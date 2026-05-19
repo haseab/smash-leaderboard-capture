@@ -96,7 +96,7 @@ class SmashBrosProcessor:
                  center_region_top=0.3, center_region_bottom=0.7, center_region_left=0.1, center_region_right=0.9,
                  game_region_top=0.1, game_region_bottom=0.5, game_region_left=0.2, game_region_right=0.8,
                  consecutive_black_threshold_secs=0.5, play_video=False, video_slowdown_factor=10,
-                 rolling_window_days=30, min_free_space_gb=5.0, use_local_ocr=False):
+                 rolling_window_days=30, min_free_space_gb=5.0, target_video_size_mb=100.0):
         """
         Initialize the Smash Bros match processor
         
@@ -118,7 +118,7 @@ class SmashBrosProcessor:
             video_slowdown_factor: Factor to slow down result screen videos for better API processing (default: 10)
             rolling_window_days: Number of days to keep match files. Files older than this will be automatically deleted. Default: 30 days.
             min_free_space_gb: Minimum free disk space to keep before starting new video writes. Deletes oldest match files when below this threshold. Default: 5 GB.
-            use_local_ocr: Whether to run local OCR and include OCR text hints in Gemini prompts. Default: False.
+            target_video_size_mb: Target size for saved full-match videos after recording. Set to 0 to disable compression.
         """
         self.device_index = device_index
         self.output_dir = os.path.normpath(output_dir)
@@ -128,7 +128,7 @@ class SmashBrosProcessor:
         self.video_slowdown_factor = video_slowdown_factor
         self.rolling_window_days = rolling_window_days
         self.min_free_space_bytes = int(min_free_space_gb * 1024 * 1024 * 1024) if min_free_space_gb and min_free_space_gb > 0 else 0
-        self.use_local_ocr = use_local_ocr
+        self.target_video_size_mb = max(0.0, float(target_video_size_mb or 0.0))
         
         # Region boundaries (as fractions of frame dimensions)
         self.center_region_top = center_region_top
@@ -172,6 +172,9 @@ class SmashBrosProcessor:
         self.current_match_filepath = None
         self.current_result_screen_filepath = None
         self.current_match_id = None  # Store database match ID
+        self.recording_start_time = None
+        self.recording_written_frames = 0
+        self.current_recording_effective_fps = None
         
         # Test mode tracking
         self.current_frame_number = 0
@@ -188,8 +191,8 @@ class SmashBrosProcessor:
         self.recording_game_end_scores = []  # Store game end confidence scores during recording
         self.current_recording_frame_index = 0  # Track frame index within current recording
         self.max_recording_frames = 3600  # Limit to ~1 minute at 60fps to prevent memory issues
-        self.frame_skip_count = 0  # Skip frames to reduce memory usage
-        self.frame_skip_interval = 2  # Store every 2nd frame to reduce memory usage
+        self.frame_skip_count = 0
+        self.frame_skip_interval = 1  # Keep every result-screen frame by default.
         self.frame_30_image = None  # Store frame 42 (~1.4 seconds at 30fps) for player identification
         self.current_frame_30_image_path = None  # Path to saved frame 42 image file
         
@@ -233,7 +236,10 @@ class SmashBrosProcessor:
         self.logger.info(f"Smash Bros Capture Processor started - Log file: {log_filename}")
         self.logger.info(f"Test mode: {self.test_mode}")
         self.logger.info(f"Output directory: {self.output_dir}")
-        self.logger.info(f"Local OCR hints: {self.use_local_ocr}")
+        if self.target_video_size_mb > 0:
+            self.logger.info(f"Full match video target size: {self.target_video_size_mb:.1f} MB")
+        else:
+            self.logger.info("Full match video compression: disabled")
     
     def initialize_capture(self):
         """Initialize video capture with exponential backoff retry"""
@@ -597,6 +603,9 @@ class SmashBrosProcessor:
         # Store current match filepath for metadata addition and potential renaming later
         self.current_match_filepath = filepath
         self.current_result_screen_filepath = None  # Will be set when result screen is saved
+        self.recording_start_time = time.monotonic()
+        self.recording_written_frames = 0
+        self.current_recording_effective_fps = None
         
         self.logger.info(f"Started recording: {filename}")
         
@@ -614,6 +623,215 @@ class SmashBrosProcessor:
         self.current_frame_30_image_path = None  # Reset frame 42 image path for new match
         
         return filepath
+
+    def get_effective_recording_fps(self):
+        if self.recording_start_time is None or self.recording_written_frames <= 0:
+            return None
+
+        elapsed_seconds = time.monotonic() - self.recording_start_time
+        if elapsed_seconds <= 0:
+            return None
+
+        return self.recording_written_frames / elapsed_seconds
+
+    def rewrite_video_with_fps(self, filepath: str, output_fps: float) -> bool:
+        if output_fps <= 0 or not os.path.exists(filepath):
+            return False
+
+        temp_filepath = filepath + ".fpsfix.mp4"
+        cap = cv2.VideoCapture(filepath)
+        if not cap.isOpened():
+            self.logger.warning(f"Could not open recorded video for FPS correction: {filepath}")
+            return False
+
+        out = None
+        try:
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if width <= 0 or height <= 0:
+                self.logger.warning(f"Could not read recorded video dimensions for FPS correction: {filepath}")
+                return False
+
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_filepath, fourcc, output_fps, (width, height))
+            if not out.isOpened():
+                self.logger.warning(f"Could not create FPS-corrected video writer: {temp_filepath}")
+                return False
+
+            rewritten_frames = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                out.write(frame)
+                rewritten_frames += 1
+
+            if rewritten_frames == 0:
+                self.logger.warning(f"No frames were rewritten during FPS correction: {filepath}")
+                return False
+
+            out.release()
+            out = None
+            cap.release()
+            cap = None
+            os.replace(temp_filepath, filepath)
+            self.logger.info(
+                f"Corrected recorded video FPS to {output_fps:.2f} using {rewritten_frames} frame(s): "
+                f"{os.path.basename(filepath)}"
+            )
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to correct recorded video FPS for {filepath}: {e}")
+            return False
+        finally:
+            if cap is not None:
+                cap.release()
+            if out is not None:
+                out.release()
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
+
+    def get_video_duration_seconds(self, filepath: str) -> Optional[float]:
+        cap = cv2.VideoCapture(filepath)
+        if not cap.isOpened():
+            return None
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if fps > 0 and frame_count > 0:
+                return frame_count / fps
+            return None
+        finally:
+            cap.release()
+
+    def compress_video_to_target_size(self, filepath: str) -> bool:
+        if self.target_video_size_mb <= 0 or not os.path.exists(filepath):
+            return False
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            self.logger.warning("ffmpeg not found; skipping full match video compression.")
+            return False
+
+        target_bytes = int(self.target_video_size_mb * 1024 * 1024)
+        original_size = os.path.getsize(filepath)
+        if original_size <= target_bytes:
+            self.logger.info(
+                f"Full match video already under target size: "
+                f"{original_size / (1024 * 1024):.1f} MB <= {self.target_video_size_mb:.1f} MB"
+            )
+            return False
+
+        duration_seconds = self.get_video_duration_seconds(filepath)
+        if not duration_seconds or duration_seconds <= 0:
+            self.logger.warning(f"Could not determine duration for compression: {filepath}")
+            return False
+
+        temp_filepath = filepath + ".compressed.mp4"
+        target_video_bits = target_bytes * 8 * 0.90
+        bitrate_kbps = max(250, int(target_video_bits / duration_seconds / 1000))
+        best_temp_path = None
+        best_temp_size = None
+
+        encoder_options = [
+            ["-c:v", "libx264", "-preset", "veryfast"],
+            ["-c:v", "mpeg4"],
+        ]
+
+        self.logger.info(
+            f"Compressing full match video from {original_size / (1024 * 1024):.1f} MB "
+            f"toward {self.target_video_size_mb:.1f} MB "
+            f"({duration_seconds:.1f}s, starting bitrate {bitrate_kbps} kbps)."
+        )
+
+        try:
+            for encoder_args in encoder_options:
+                current_bitrate_kbps = bitrate_kbps
+
+                for attempt in range(3):
+                    if os.path.exists(temp_filepath):
+                        os.remove(temp_filepath)
+
+                    ffmpeg_cmd = [
+                        ffmpeg_path,
+                        "-y",
+                        "-i",
+                        filepath,
+                        "-an",
+                        *encoder_args,
+                        "-b:v",
+                        f"{current_bitrate_kbps}k",
+                        "-maxrate",
+                        f"{current_bitrate_kbps}k",
+                        "-bufsize",
+                        f"{current_bitrate_kbps * 2}k",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-movflags",
+                        "+faststart",
+                        temp_filepath,
+                    ]
+
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if result.returncode != 0 or not os.path.exists(temp_filepath):
+                        encoder_name = encoder_args[1] if len(encoder_args) > 1 else "unknown"
+                        self.logger.warning(
+                            f"ffmpeg compression failed with {encoder_name}: {result.stderr.strip()}"
+                        )
+                        break
+
+                    output_size = os.path.getsize(temp_filepath)
+                    if best_temp_size is None or output_size < best_temp_size:
+                        if best_temp_path and os.path.exists(best_temp_path):
+                            os.remove(best_temp_path)
+                        best_temp_path = filepath + ".best-compressed.mp4"
+                        os.replace(temp_filepath, best_temp_path)
+                        best_temp_size = output_size
+                    else:
+                        os.remove(temp_filepath)
+
+                    if output_size <= target_bytes:
+                        os.replace(best_temp_path, filepath)
+                        self.logger.info(
+                            f"Compressed full match video to {output_size / (1024 * 1024):.1f} MB: "
+                            f"{os.path.basename(filepath)}"
+                        )
+                        return True
+
+                    next_bitrate_kbps = max(
+                        250,
+                        int(current_bitrate_kbps * (target_bytes / output_size) * 0.92),
+                    )
+                    if next_bitrate_kbps >= current_bitrate_kbps:
+                        break
+
+                    self.logger.info(
+                        f"Compressed output was {output_size / (1024 * 1024):.1f} MB; "
+                        f"retrying at {next_bitrate_kbps} kbps."
+                    )
+                    current_bitrate_kbps = next_bitrate_kbps
+
+            if best_temp_path and best_temp_size and best_temp_size < original_size:
+                os.replace(best_temp_path, filepath)
+                self.logger.warning(
+                    f"Compressed full match video to {best_temp_size / (1024 * 1024):.1f} MB, "
+                    f"but did not reach the {self.target_video_size_mb:.1f} MB target."
+                )
+                return True
+
+            self.logger.warning("Compression did not produce a smaller file; keeping original.")
+            return False
+        finally:
+            for cleanup_path in (temp_filepath, best_temp_path):
+                if cleanup_path and os.path.exists(cleanup_path):
+                    try:
+                        os.remove(cleanup_path)
+                    except OSError:
+                        pass
     
     def clear_frame_buffers(self):
         """
@@ -641,9 +859,35 @@ class SmashBrosProcessor:
             self.out.release()
             self.out = None
             self.logger.info("Stopped recording")
+
+            effective_fps = self.get_effective_recording_fps()
+            extraction_fps = self.fps
+            if effective_fps and self.fps > 0:
+                fps_delta = abs(effective_fps - self.fps) / self.fps
+                self.logger.info(
+                    f"Recording wrote {self.recording_written_frames} frame(s) at "
+                    f"{effective_fps:.2f} effective fps (writer fps: {self.fps})."
+                )
+                if fps_delta > 0.05:
+                    self.logger.warning(
+                        f"Recorded frame rate differed from writer fps by {fps_delta:.0%}; "
+                        f"correcting MP4 playback speed to {effective_fps:.2f} fps."
+                    )
+                    if self.current_match_filepath:
+                        self.rewrite_video_with_fps(self.current_match_filepath, effective_fps)
+                    extraction_fps = effective_fps
+            self.current_recording_effective_fps = extraction_fps
+
+            if self.current_match_filepath:
+                self.compress_video_to_target_size(self.current_match_filepath)
             
             # Extract result screens if we have recorded frames
-            self.extract_result_screens()
+            previous_fps = self.fps
+            self.fps = extraction_fps
+            try:
+                self.extract_result_screens()
+            finally:
+                self.fps = previous_fps
             
             # Clear frame buffers to free memory
             self.clear_frame_buffers()
@@ -1125,6 +1369,7 @@ class SmashBrosProcessor:
             # Write frame to video
             if self.out:
                 self.out.write(frame)
+                self.recording_written_frames += 1
             
             # Capture frame 42 (~1.4 seconds at 30fps) for player identification
             # Check BEFORE incrementing, so index 41 = frame 42 (0-indexed)
@@ -1132,7 +1377,7 @@ class SmashBrosProcessor:
                 self.frame_30_image = frame.copy()
                 self.logger.info(f"Captured frame 42 (~1.4 seconds into match) for player identification")
             
-            # Store frame and game end confidence for result screen extraction (with frame skipping)
+            # Store frame and game end confidence for result screen extraction.
             self.frame_skip_count += 1
             if self.frame_skip_count >= self.frame_skip_interval:
                 self.recording_frames.append(frame.copy())
@@ -1410,7 +1655,6 @@ class SmashBrosProcessor:
                 model=gemini_model,
                 logger=self.logger,
                 player_name_examples=self.get_player_name_examples(),
-                use_local_ocr=self.use_local_ocr,
             )
         except Exception as e:
             print(f"Error extracting match stats: {e}")
@@ -1869,7 +2113,7 @@ def main():
     
     # Video processing arguments
     parser.add_argument('--video-slowdown-factor', type=int, default=10, help='Factor to slow down result screen videos for better API processing (default: 10)')
-    parser.add_argument('--ocr', action='store_true', help='Run local Tesseract OCR and include OCR text hints in the Gemini prompt (default: off)')
+    parser.add_argument('--target-video-size-mb', type=float, default=100.0, help='Target size for saved full match videos after recording (default: 100). Set to 0 to disable compression.')
     
     # Rolling window arguments
     parser.add_argument('--rolling-window-days', type=int, default=30, help='Number of days to keep match files. Files older than this will be automatically deleted (default: 30). Set to 0 to disable cleanup.')
@@ -1922,7 +2166,7 @@ def main():
         video_slowdown_factor=args.video_slowdown_factor,
         rolling_window_days=args.rolling_window_days,
         min_free_space_gb=args.min_free_space_gb,
-        use_local_ocr=args.ocr
+        target_video_size_mb=args.target_video_size_mb
     )
     
     # Handle test-threshold mode

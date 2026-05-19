@@ -37,7 +37,6 @@ Pygments>=2.19.1
 PyJWT>=2.10.1
 pytest>=8.4.0
 pytest-mock>=3.14.1
-pytesseract>=0.3.13
 python-dateutil>=2.9.0
 python-dotenv>=1.1.0
 realtime>=2.4.3
