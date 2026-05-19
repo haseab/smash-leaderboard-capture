@@ -24,6 +24,7 @@ DEFAULT_FILE_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_GEMINI_MAX_RETRIES = 5
 DEFAULT_GEMINI_RETRY_DELAY_SECONDS = 300
 DEFAULT_MAX_RESULT_SCREEN_SECONDS = 10.0
+DEFAULT_GEMINI_API_VERSION = "v1beta"
 
 
 class GeminiPlayerStats(BaseModel):
@@ -77,11 +78,18 @@ def create_gemini_client():
     if not api_key:
         raise ValueError("GEMINI_API_KEY not found in environment variables")
 
-    api_version = os.getenv("GEMINI_API_VERSION", "v1alpha")
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(api_version=api_version),
+        http_options=types.HttpOptions(api_version=get_gemini_api_version()),
     )
+
+
+def get_gemini_api_version() -> str:
+    return os.getenv("GEMINI_API_VERSION", DEFAULT_GEMINI_API_VERSION).strip() or DEFAULT_GEMINI_API_VERSION
+
+
+def _uses_v1alpha_api() -> bool:
+    return get_gemini_api_version().lower() == "v1alpha"
 
 
 def get_gemini_model() -> str:
@@ -365,17 +373,22 @@ def _make_file_part(file_info, video_sample_fps: Optional[float] = None):
     if not file_uri:
         raise ValueError(f"Uploaded Gemini file {file_info.name} does not have a file URI")
 
-    part_kwargs = {
-        "file_data": types.FileData(file_uri=file_uri, mime_type=mime_type),
-    }
+    part_kwargs = {}
     if video_sample_fps:
         part_kwargs["video_metadata"] = types.VideoMetadata(fps=video_sample_fps)
-    if "media_resolution" in getattr(types.Part, "model_fields", {}) and hasattr(types, "PartMediaResolution"):
+    if (
+        _uses_v1alpha_api()
+        and "media_resolution" in getattr(types.Part, "model_fields", {})
+        and hasattr(types, "PartMediaResolution")
+    ):
         part_kwargs["media_resolution"] = types.PartMediaResolution(
             level=types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH
         )
 
-    return types.Part(**part_kwargs)
+    file_part = types.Part.from_uri(file_uri=file_uri, mime_type=mime_type)
+    for key, value in part_kwargs.items():
+        setattr(file_part, key, value)
+    return file_part
 
 
 def _build_prompt(
@@ -454,7 +467,7 @@ def _build_generate_config():
         config_kwargs["response_mime_type"] = "application/json"
         config_kwargs["response_schema"] = GeminiMatchStats
 
-    if "media_resolution" in model_fields and hasattr(types, "MediaResolution"):
+    if _uses_v1alpha_api() and "media_resolution" in model_fields and hasattr(types, "MediaResolution"):
         config_kwargs["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_HIGH
 
     thinking_config = _build_thinking_config()
@@ -590,6 +603,8 @@ def analyze_match_results_video(
     max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)
     retry_delay = _env_int("GEMINI_RETRY_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_DELAY_SECONDS)
     max_result_seconds = _env_float("GEMINI_MAX_RESULT_SCREEN_SECONDS", DEFAULT_MAX_RESULT_SCREEN_SECONDS)
+    api_version = get_gemini_api_version()
+    media_resolution_label = "HIGH" if _uses_v1alpha_api() else "default"
 
     uploaded_files = []
 
@@ -668,7 +683,8 @@ def analyze_match_results_video(
                         logger,
                         "info",
                         f"Analyzing result screen with {candidate_model}, "
-                        f"media_resolution=HIGH, video_sample_fps={video_sample_fps}.",
+                        f"api_version={api_version}, media_resolution={media_resolution_label}, "
+                        f"video_sample_fps={video_sample_fps}.",
                     )
                     try:
                         response = _generate_content(
