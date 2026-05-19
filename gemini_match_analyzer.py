@@ -16,6 +16,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_VIDEO_SAMPLE_FPS = 4.0
 DEFAULT_UPLOAD_TIMEOUT_SECONDS = 300
 DEFAULT_RESULT_STILL_COUNT = 4
+DEFAULT_FILE_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_GEMINI_MAX_RETRIES = 5
 DEFAULT_GEMINI_RETRY_BASE_DELAY_SECONDS = 60
 DEFAULT_GEMINI_RETRY_MAX_DELAY_SECONDS = 300
@@ -194,9 +195,16 @@ def _file_state_name(file_info) -> str:
     return str(state).split(".")[-1].upper()
 
 
-def _wait_for_file_active(client, uploaded_file, timeout_seconds: int, logger=None):
+def _wait_for_file_active(
+    client,
+    uploaded_file,
+    timeout_seconds: int,
+    poll_interval_seconds: float,
+    logger=None,
+):
     deadline = time.monotonic() + timeout_seconds
     last_state = "UNKNOWN"
+    poll_interval_seconds = max(1.0, poll_interval_seconds)
 
     while time.monotonic() < deadline:
         file_info = client.files.get(name=uploaded_file.name)
@@ -206,7 +214,7 @@ def _wait_for_file_active(client, uploaded_file, timeout_seconds: int, logger=No
         if last_state == "FAILED":
             error = getattr(file_info, "error", None)
             raise RuntimeError(f"Gemini file processing failed for {uploaded_file.name}: {error}")
-        time.sleep(1)
+        time.sleep(min(poll_interval_seconds, max(0.0, deadline - time.monotonic())))
 
     raise TimeoutError(
         f"Timed out after {timeout_seconds}s waiting for Gemini file {uploaded_file.name} "
@@ -214,10 +222,21 @@ def _wait_for_file_active(client, uploaded_file, timeout_seconds: int, logger=No
     )
 
 
-def _upload_and_wait(client, path: str, timeout_seconds: int, logger=None):
+def _upload_and_wait(
+    client,
+    path: str,
+    timeout_seconds: int,
+    poll_interval_seconds: float,
+    logger=None,
+):
     uploaded = client.files.upload(file=path)
-    _log(logger, "info", f"Uploaded {os.path.basename(path)} to Gemini; waiting for processing...")
-    return _wait_for_file_active(client, uploaded, timeout_seconds, logger)
+    _log(
+        logger,
+        "info",
+        f"Uploaded {os.path.basename(path)} to Gemini; waiting for processing "
+        f"(poll every {poll_interval_seconds:.1f}s)...",
+    )
+    return _wait_for_file_active(client, uploaded, timeout_seconds, poll_interval_seconds, logger)
 
 
 def _delete_uploaded_files(client, uploaded_files, logger=None):
@@ -387,6 +406,32 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _exception_details(exc: Exception) -> str:
+    details = {
+        "type": exc.__class__.__name__,
+        "message": str(exc),
+    }
+    for attr_name in ("code", "status", "reason", "details", "metadata", "args"):
+        attr_value = getattr(exc, attr_name, None)
+        if attr_value:
+            details[attr_name] = attr_value
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        response_details = {}
+        for attr_name in ("status_code", "reason", "text"):
+            attr_value = getattr(response, attr_name, None)
+            if attr_value:
+                response_details[attr_name] = attr_value
+        headers = getattr(response, "headers", None)
+        if headers:
+            response_details["headers"] = dict(headers)
+        if response_details:
+            details["response"] = response_details
+
+    return json.dumps(details, default=str, ensure_ascii=True)
+
+
 def _generate_content_with_retry(
     client,
     *,
@@ -408,6 +453,13 @@ def _generate_content_with_retry(
             )
         except Exception as exc:
             if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                if _is_rate_limit_error(exc):
+                    _log(
+                        logger,
+                        "error",
+                        f"Gemini rate limit failed after {attempt} retries. "
+                        f"Details: {_exception_details(exc)}",
+                    )
                 raise
 
             delay = min(max_delay_seconds, base_delay_seconds * (2 ** attempt))
@@ -417,7 +469,7 @@ def _generate_content_with_retry(
                 logger,
                 "warning",
                 f"Gemini rate limit hit; retrying in {delay:.1f}s "
-                f"(attempt {attempt}/{max_retries}).",
+                f"(attempt {attempt}/{max_retries}). Details: {_exception_details(exc)}",
             )
             time.sleep(delay)
 
@@ -452,6 +504,7 @@ def analyze_match_results_video(
     video_sample_fps = _env_float("GEMINI_VIDEO_SAMPLE_FPS", DEFAULT_VIDEO_SAMPLE_FPS)
     timeout_seconds = _env_int("GEMINI_UPLOAD_TIMEOUT_SECONDS", DEFAULT_UPLOAD_TIMEOUT_SECONDS)
     result_still_count = _env_int("GEMINI_RESULT_STILL_COUNT", DEFAULT_RESULT_STILL_COUNT)
+    file_poll_interval = _env_float("GEMINI_FILE_POLL_INTERVAL_SECONDS", DEFAULT_FILE_POLL_INTERVAL_SECONDS)
     max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)
     retry_base_delay = _env_int("GEMINI_RETRY_BASE_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_BASE_DELAY_SECONDS)
     retry_max_delay = _env_int("GEMINI_RETRY_MAX_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_MAX_DELAY_SECONDS)
@@ -476,17 +529,35 @@ def analyze_match_results_video(
 
             if context_image_path and os.path.exists(context_image_path):
                 _log(logger, "info", "Uploading frame 42 image to Gemini for player-name context.")
-                context_image_file = _upload_and_wait(client, context_image_path, timeout_seconds, logger)
+                context_image_file = _upload_and_wait(
+                    client,
+                    context_image_path,
+                    timeout_seconds,
+                    file_poll_interval,
+                    logger,
+                )
                 uploaded_files.append(context_image_file)
                 parts.append(_make_file_part(context_image_file))
 
             for still_path in result_still_paths:
-                still_file = _upload_and_wait(client, still_path, timeout_seconds, logger)
+                still_file = _upload_and_wait(
+                    client,
+                    still_path,
+                    timeout_seconds,
+                    file_poll_interval,
+                    logger,
+                )
                 uploaded_files.append(still_file)
                 parts.append(_make_file_part(still_file))
 
             _log(logger, "info", "Uploading slowed result screen video to Gemini.")
-            video_file = _upload_and_wait(client, slowed_video_path, timeout_seconds, logger)
+            video_file = _upload_and_wait(
+                client,
+                slowed_video_path,
+                timeout_seconds,
+                file_poll_interval,
+                logger,
+            )
             uploaded_files.append(video_file)
             parts.append(_make_file_part(video_file, video_sample_fps=video_sample_fps))
 
