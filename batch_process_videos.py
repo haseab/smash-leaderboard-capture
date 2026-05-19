@@ -104,11 +104,13 @@ class BatchVideoProcessor:
         slowdown_factor: int = 10,
         dry_run: bool = False,
         api_delay_seconds: float = 60.0,
+        use_local_ocr: bool = False,
     ):
         self.directory = directory
         self.slowdown_factor = slowdown_factor
         self.dry_run = dry_run
         self.api_delay_seconds = max(0.0, api_delay_seconds)
+        self.use_local_ocr = use_local_ocr
         self.processed_count = 0
         self.skipped_count = 0
         self.failed_count = 0
@@ -151,6 +153,7 @@ class BatchVideoProcessor:
         self.logger.info(f"Processing directory: {self.directory}")
         self.logger.info(f"Slowdown factor: {self.slowdown_factor}")
         self.logger.info(f"Dry run: {self.dry_run}")
+        self.logger.info(f"Local OCR hints: {self.use_local_ocr}")
 
     def detect_game_end(self, frame) -> tuple:
         """
@@ -401,6 +404,7 @@ class BatchVideoProcessor:
                 output_fps=fps,
                 model=gemini_model,
                 logger=self.logger,
+                use_local_ocr=self.use_local_ocr,
             )
 
             if not player_stats:
@@ -768,6 +772,7 @@ def main():
     parser.add_argument('--slowdown', type=int, default=10, help='Video slowdown factor for Gemini (default: 10)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be processed without actually processing')
     parser.add_argument('--api-delay', type=float, default=60.0, help='Seconds to wait between videos to avoid Gemini rate limits (default: 60)')
+    parser.add_argument('--ocr', action='store_true', help='Run local Tesseract OCR and include OCR text hints in the Gemini prompt (default: off)')
 
     args = parser.parse_args()
 
@@ -775,7 +780,7 @@ def main():
         print(f"Error: Directory not found: {args.directory}")
         sys.exit(1)
 
-    processor = BatchVideoProcessor(args.directory, args.slowdown, args.dry_run, args.api_delay)
+    processor = BatchVideoProcessor(args.directory, args.slowdown, args.dry_run, args.api_delay, args.ocr)
     processor.process_all()
 
 

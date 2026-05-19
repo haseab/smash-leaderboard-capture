@@ -96,7 +96,7 @@ class SmashBrosProcessor:
                  center_region_top=0.3, center_region_bottom=0.7, center_region_left=0.1, center_region_right=0.9,
                  game_region_top=0.1, game_region_bottom=0.5, game_region_left=0.2, game_region_right=0.8,
                  consecutive_black_threshold_secs=0.5, play_video=False, video_slowdown_factor=10,
-                 rolling_window_days=30, min_free_space_gb=5.0):
+                 rolling_window_days=30, min_free_space_gb=5.0, use_local_ocr=False):
         """
         Initialize the Smash Bros match processor
         
@@ -118,6 +118,7 @@ class SmashBrosProcessor:
             video_slowdown_factor: Factor to slow down result screen videos for better API processing (default: 10)
             rolling_window_days: Number of days to keep match files. Files older than this will be automatically deleted. Default: 30 days.
             min_free_space_gb: Minimum free disk space to keep before starting new video writes. Deletes oldest match files when below this threshold. Default: 5 GB.
+            use_local_ocr: Whether to run local OCR and include OCR text hints in Gemini prompts. Default: False.
         """
         self.device_index = device_index
         self.output_dir = os.path.normpath(output_dir)
@@ -127,6 +128,7 @@ class SmashBrosProcessor:
         self.video_slowdown_factor = video_slowdown_factor
         self.rolling_window_days = rolling_window_days
         self.min_free_space_bytes = int(min_free_space_gb * 1024 * 1024 * 1024) if min_free_space_gb and min_free_space_gb > 0 else 0
+        self.use_local_ocr = use_local_ocr
         
         # Region boundaries (as fractions of frame dimensions)
         self.center_region_top = center_region_top
@@ -231,6 +233,7 @@ class SmashBrosProcessor:
         self.logger.info(f"Smash Bros Capture Processor started - Log file: {log_filename}")
         self.logger.info(f"Test mode: {self.test_mode}")
         self.logger.info(f"Output directory: {self.output_dir}")
+        self.logger.info(f"Local OCR hints: {self.use_local_ocr}")
     
     def initialize_capture(self):
         """Initialize video capture with exponential backoff retry"""
@@ -1407,6 +1410,7 @@ class SmashBrosProcessor:
                 model=gemini_model,
                 logger=self.logger,
                 player_name_examples=self.get_player_name_examples(),
+                use_local_ocr=self.use_local_ocr,
             )
         except Exception as e:
             print(f"Error extracting match stats: {e}")
@@ -1865,6 +1869,7 @@ def main():
     
     # Video processing arguments
     parser.add_argument('--video-slowdown-factor', type=int, default=10, help='Factor to slow down result screen videos for better API processing (default: 10)')
+    parser.add_argument('--ocr', action='store_true', help='Run local Tesseract OCR and include OCR text hints in the Gemini prompt (default: off)')
     
     # Rolling window arguments
     parser.add_argument('--rolling-window-days', type=int, default=30, help='Number of days to keep match files. Files older than this will be automatically deleted (default: 30). Set to 0 to disable cleanup.')
@@ -1916,7 +1921,8 @@ def main():
         play_video=args.play_video,
         video_slowdown_factor=args.video_slowdown_factor,
         rolling_window_days=args.rolling_window_days,
-        min_free_space_gb=args.min_free_space_gb
+        min_free_space_gb=args.min_free_space_gb,
+        use_local_ocr=args.ocr
     )
     
     # Handle test-threshold mode

@@ -1,8 +1,10 @@
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from typing import List, Optional
 
 import cv2
@@ -23,6 +25,13 @@ DEFAULT_RESULT_STILL_COUNT = 0
 DEFAULT_FILE_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_GEMINI_MAX_RETRIES = 5
 DEFAULT_GEMINI_RETRY_DELAY_SECONDS = 300
+DEFAULT_MAX_RESULT_SCREEN_SECONDS = 10.0
+DEFAULT_LOCAL_OCR_HINTS = False
+DEFAULT_LOCAL_OCR_FRAME_STRIDE = 1
+DEFAULT_LOCAL_OCR_MAX_FRAMES = 300
+DEFAULT_LOCAL_OCR_MAX_LINES = 40
+DEFAULT_LOCAL_OCR_MAX_TOKENS = 80
+DEFAULT_LOCAL_OCR_MIN_LINE_COUNT = 2
 
 
 class GeminiPlayerStats(BaseModel):
@@ -135,6 +144,13 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _get_video_fps(video_path: str, fallback_fps: int = 30) -> int:
     cap = cv2.VideoCapture(video_path)
     try:
@@ -169,11 +185,91 @@ def _slow_down_video(
     subprocess.run(ffmpeg_cmd, check=True)
 
 
+def trim_video_to_max_seconds(
+    source_video_path: str,
+    output_video_path: str,
+    max_seconds: float = DEFAULT_MAX_RESULT_SCREEN_SECONDS,
+    logger=None,
+) -> str:
+    if max_seconds <= 0:
+        return source_video_path
+
+    cap = cv2.VideoCapture(source_video_path)
+    if not cap.isOpened():
+        _log(logger, "warning", f"Could not open video for trimming: {source_video_path}")
+        return source_video_path
+
+    writer = None
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if fps <= 0:
+            fps = float(_get_video_fps(source_video_path))
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        max_frames = int(round(max_seconds * fps))
+        if max_frames <= 0:
+            return source_video_path
+
+        if total_frames > 0 and total_frames <= max_frames:
+            return source_video_path
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            _log(logger, "warning", f"Could not read video dimensions for trimming: {source_video_path}")
+            return source_video_path
+
+        output_dir = os.path.dirname(output_video_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            _log(logger, "warning", f"Could not create trimmed video: {output_video_path}")
+            return source_video_path
+
+        written_frames = 0
+        while written_frames < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            writer.write(frame)
+            written_frames += 1
+
+        if written_frames == 0:
+            return source_video_path
+
+        original_duration = total_frames / fps if total_frames > 0 and fps > 0 else None
+        trimmed_duration = written_frames / fps if fps > 0 else None
+        if original_duration is not None:
+            _log(
+                logger,
+                "info",
+                f"Result screen is {original_duration:.1f}s ({total_frames} frame(s)); "
+                f"using first {trimmed_duration:.1f}s ({written_frames} frame(s)) for Gemini/OCR.",
+            )
+        else:
+            _log(
+                logger,
+                "info",
+                f"Using first {trimmed_duration:.1f}s ({written_frames} frame(s)) for Gemini/OCR.",
+            )
+
+        return output_video_path
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+
 def _extract_result_stills(
     video_path: str,
     output_dir: str,
     max_stills: int = DEFAULT_RESULT_STILL_COUNT,
 ) -> List[str]:
+    if max_stills <= 0:
+        return []
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
@@ -204,6 +300,181 @@ def _extract_result_stills(
         return still_paths
     finally:
         cap.release()
+
+
+def _normalize_ocr_line(line: str) -> str:
+    line = line.replace("|", " ").replace("—", "-").replace("–", "-")
+    line = re.sub(r"\s+", " ", line).strip()
+    line = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", line)
+    return line
+
+
+def _ocr_frame(frame) -> List[str]:
+    import pytesseract
+
+    scale = _env_float("LOCAL_OCR_SCALE", 2.0)
+    if scale != 1:
+        frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    thresholded = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        7,
+    )
+
+    config = os.getenv("LOCAL_OCR_TESSERACT_CONFIG", "--psm 6")
+    text = pytesseract.image_to_string(thresholded, config=config)
+    lines = []
+    for raw_line in text.splitlines():
+        line = _normalize_ocr_line(raw_line)
+        if not line:
+            continue
+        if len(line) < 2 and not line.isdigit():
+            continue
+        if len(line) > 100:
+            continue
+        if not re.search(r"[A-Za-z0-9]", line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def build_local_ocr_union(video_path: str, logger=None) -> Optional[dict]:
+    try:
+        import pytesseract
+    except Exception as exc:
+        _log(logger, "warning", f"Local OCR disabled; pytesseract is not available: {exc}")
+        return None
+
+    tesseract_cmd = os.getenv("TESSERACT_CMD")
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return None
+
+        frame_stride = _env_int("LOCAL_OCR_FRAME_STRIDE", DEFAULT_LOCAL_OCR_FRAME_STRIDE)
+        max_frames = _env_int("LOCAL_OCR_MAX_FRAMES", DEFAULT_LOCAL_OCR_MAX_FRAMES)
+        if max_frames > 0:
+            frame_stride = max(frame_stride, int((total_frames + max_frames - 1) / max_frames))
+
+        _log(
+            logger,
+            "info",
+            f"Running local OCR hints over result-screen frames "
+            f"(total={total_frames}, stride={frame_stride}).",
+        )
+
+        line_counts: Counter[str] = Counter()
+        line_examples = {}
+        token_counts: Counter[str] = Counter()
+        processed_frames = 0
+        frame_index = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_index % frame_stride == 0:
+                try:
+                    lines = _ocr_frame(frame)
+                except Exception as exc:
+                    _log(logger, "warning", f"Local OCR failed on frame {frame_index}: {exc}")
+                    return None
+
+                processed_frames += 1
+                for line in lines:
+                    canonical_line = line.lower()
+                    line_examples.setdefault(canonical_line, line)
+                    line_counts[canonical_line] += 1
+                    for token in re.findall(r"[A-Za-z][A-Za-z0-9_'-]{1,}|[0-9]+", line):
+                        token_counts[token.lower()] += 1
+
+            frame_index += 1
+
+        if processed_frames == 0 or not line_counts:
+            _log(logger, "info", f"Local OCR processed {processed_frames} frame(s), but found no usable text.")
+            return None
+
+        _log(
+            logger,
+            "info",
+            f"Local OCR processed {processed_frames}/{total_frames} result-screen frame(s), "
+            f"found {len(line_counts)} unique line(s) and {len(token_counts)} unique token(s).",
+        )
+
+        return {
+            "processed_frames": processed_frames,
+            "total_frames": total_frames,
+            "line_counts": line_counts,
+            "line_examples": line_examples,
+            "token_counts": token_counts,
+        }
+    finally:
+        cap.release()
+
+
+def _build_local_ocr_hints(video_path: str, logger=None, enabled: Optional[bool] = None) -> Optional[str]:
+    if enabled is None:
+        enabled = _env_bool("LOCAL_OCR_HINTS", DEFAULT_LOCAL_OCR_HINTS)
+    if not enabled:
+        return None
+
+    ocr_union = build_local_ocr_union(video_path, logger)
+    if not ocr_union:
+        return None
+
+    processed_frames = ocr_union["processed_frames"]
+    total_frames = ocr_union["total_frames"]
+    line_counts = ocr_union["line_counts"]
+    line_examples = ocr_union["line_examples"]
+    token_counts = ocr_union["token_counts"]
+
+    try:
+        max_lines = _env_int("LOCAL_OCR_MAX_LINES", DEFAULT_LOCAL_OCR_MAX_LINES)
+        max_tokens = _env_int("LOCAL_OCR_MAX_TOKENS", DEFAULT_LOCAL_OCR_MAX_TOKENS)
+        min_line_count = _env_int("LOCAL_OCR_MIN_LINE_COUNT", DEFAULT_LOCAL_OCR_MIN_LINE_COUNT)
+
+        line_items = [
+            (line, count)
+            for line, count in line_counts.most_common()
+            if count >= min_line_count
+        ]
+        if not line_items:
+            line_items = line_counts.most_common(max_lines)
+        else:
+            line_items = line_items[:max_lines]
+
+        token_items = token_counts.most_common(max_tokens)
+        line_summary = "\n".join(
+            f"- {line_examples.get(line, line)!r} (seen {count} frame(s))"
+            for line, count in line_items
+        )
+        token_summary = ", ".join(f"{token}({count})" for token, count in token_items)
+
+        return f"""Local OCR union from the result-screen video.
+This OCR is noisy and should be treated as hints only; verify against the video.
+Processed frames: {processed_frames}/{total_frames}
+Frequently seen OCR lines:
+{line_summary}
+OCR token union with frame counts:
+{token_summary}
+"""
+    except Exception as exc:
+        _log(logger, "warning", f"Failed to build local OCR hints: {exc}")
+        return None
 
 
 def _file_state_name(file_info) -> str:
@@ -294,6 +565,7 @@ def _build_prompt(
     has_player_context_image: bool,
     result_still_count: int,
     player_name_examples: Optional[str] = None,
+    local_ocr_hints: Optional[str] = None,
 ) -> str:
     player_context_note = ""
     if has_player_context_image:
@@ -307,10 +579,18 @@ I included one early-match frame captured around frame 42. Use it only to identi
 I also included {result_still_count} full-resolution still PNG frame(s) sampled from the results screen. Prefer these still images for OCR of player names, character names, KOs, Falls, SDs, and the winner marker. Use the video to resolve menu transitions or values that appear only briefly.
 """
 
+    local_ocr_note = ""
+    if local_ocr_hints:
+        local_ocr_note = f"""
+I also ran local OCR across the result-screen video frames and included the union of text it saw below. Use this only as noisy supporting evidence; do not let OCR override what is visible in the video.
+
+{local_ocr_hints}
+"""
+
     player_examples_text = player_name_examples or "habeas, shafaq, jmoon, subby, keneru, and kento"
 
     return f"""Here is a Super Smash Bros Ultimate results screen capture.
-{player_context_note}{result_still_note}
+{player_context_note}{result_still_note}{local_ocr_note}
 Return exactly one JSON object that matches this shape:
 
 {{
@@ -488,6 +768,7 @@ def analyze_match_results_video(
     model: Optional[str] = None,
     logger=None,
     player_name_examples: Optional[str] = None,
+    use_local_ocr: Optional[bool] = None,
 ) -> Optional[List[PlayerStats]]:
     if not os.path.exists(result_video_path):
         raise FileNotFoundError(f"Result video file not found: {result_video_path}")
@@ -501,21 +782,29 @@ def analyze_match_results_video(
     file_poll_interval = _env_float("GEMINI_FILE_POLL_INTERVAL_SECONDS", DEFAULT_FILE_POLL_INTERVAL_SECONDS)
     max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_GEMINI_MAX_RETRIES)
     retry_delay = _env_int("GEMINI_RETRY_DELAY_SECONDS", DEFAULT_GEMINI_RETRY_DELAY_SECONDS)
+    max_result_seconds = _env_float("GEMINI_MAX_RESULT_SCREEN_SECONDS", DEFAULT_MAX_RESULT_SCREEN_SECONDS)
 
     uploaded_files = []
 
     with tempfile.TemporaryDirectory(prefix="smash_gemini_") as temp_dir:
+        analysis_video_path = trim_video_to_max_seconds(
+            result_video_path,
+            os.path.join(temp_dir, "result_screen_first_10s.mp4"),
+            max_result_seconds,
+            logger,
+        )
         slowed_video_path = os.path.join(temp_dir, "result_screen_slowed.mp4")
 
         _log(logger, "info", f"Slowing result screen video by {slowdown_factor}x for Gemini.")
-        _slow_down_video(result_video_path, slowed_video_path, slowdown_factor, output_fps)
+        _slow_down_video(analysis_video_path, slowed_video_path, slowdown_factor, output_fps)
 
         result_still_paths = _extract_result_stills(
-            result_video_path,
+            analysis_video_path,
             temp_dir,
             max_stills=result_still_count,
         )
         _log(logger, "info", f"Extracted {len(result_still_paths)} high-resolution result still(s) for OCR.")
+        local_ocr_hints = _build_local_ocr_hints(analysis_video_path, logger, enabled=use_local_ocr)
 
         try:
             parts = []
@@ -560,6 +849,7 @@ def analyze_match_results_video(
                         has_player_context_image=bool(context_image_path and os.path.exists(context_image_path)),
                         result_still_count=len(result_still_paths),
                         player_name_examples=player_name_examples,
+                        local_ocr_hints=local_ocr_hints,
                     )
                 )
             )

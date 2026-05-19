@@ -63,10 +63,17 @@ except Exception as e:
     supabase_client = None
 
 class ResultVideoProcessor:
-    def __init__(self, video_path: str, slowdown_factor: int = 5, force_save: bool = False):
+    def __init__(
+        self,
+        video_path: str,
+        slowdown_factor: int = 5,
+        force_save: bool = False,
+        use_local_ocr: bool = False,
+    ):
         self.video_path = video_path
         self.slowdown_factor = slowdown_factor
         self.force_save = force_save
+        self.use_local_ocr = use_local_ocr
         self.setup_logging()
     
     def setup_logging(self):
@@ -97,6 +104,7 @@ class ResultVideoProcessor:
         self.logger.info(f"Processing video: {self.video_path}")
         self.logger.info(f"Slowdown factor: {self.slowdown_factor}")
         self.logger.info(f"Force save: {self.force_save}")
+        self.logger.info(f"Local OCR hints: {self.use_local_ocr}")
     
     def get_match_stats(self) -> Optional[List[PlayerStats]]:
         """Extract player stats from result screen video using Gemini API"""
@@ -118,6 +126,7 @@ class ResultVideoProcessor:
                 slowdown_factor=self.slowdown_factor,
                 model=gemini_model,
                 logger=self.logger,
+                use_local_ocr=self.use_local_ocr,
             )
 
             if not player_stats:
@@ -447,6 +456,7 @@ def main():
     parser.add_argument('video_path', type=str, help='Path to the result screen video file')
     parser.add_argument('--slowdown', type=int, default=5, help='Video slowdown factor (default: 5)')
     parser.add_argument('--force-save', action='store_true', help='Force save even if match has CPU/unknown players/is online')
+    parser.add_argument('--ocr', action='store_true', help='Run local Tesseract OCR and include OCR text hints in the Gemini prompt (default: off)')
     
     args = parser.parse_args()
     
@@ -455,7 +465,7 @@ def main():
         sys.exit(1)
     
     # Create processor and run
-    processor = ResultVideoProcessor(args.video_path, args.slowdown, args.force_save)
+    processor = ResultVideoProcessor(args.video_path, args.slowdown, args.force_save, args.ocr)
     success = processor.process()
     
     if success:
