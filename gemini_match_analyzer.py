@@ -13,6 +13,11 @@ from pydantic import BaseModel, Field
 
 
 DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_GEMINI_FALLBACK_MODELS = [
+    "gemini-3-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+]
 DEFAULT_VIDEO_SAMPLE_FPS = 4.0
 DEFAULT_UPLOAD_TIMEOUT_SECONDS = 300
 DEFAULT_RESULT_STILL_COUNT = 4
@@ -82,6 +87,25 @@ def create_gemini_client():
 
 def get_gemini_model() -> str:
     return os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+
+
+def _env_list(name: str, default: List[str]) -> List[str]:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return list(default)
+    return [value.strip() for value in raw_value.split(",") if value.strip()]
+
+
+def get_gemini_fallback_models() -> List[str]:
+    return _env_list("GEMINI_FALLBACK_MODELS", DEFAULT_GEMINI_FALLBACK_MODELS)
+
+
+def _ordered_models(primary_model: str) -> List[str]:
+    models = []
+    for candidate in [primary_model, *get_gemini_fallback_models()]:
+        if candidate and candidate not in models:
+            models.append(candidate)
+    return models
 
 
 def _log(logger, level: str, message: str):
@@ -456,7 +480,7 @@ def _generate_content_with_retry(
                 if _is_rate_limit_error(exc):
                     _log(
                         logger,
-                        "error",
+                        "warning",
                         f"Gemini rate limit failed after {attempt} retries. "
                         f"Details: {_exception_details(exc)}",
                     )
@@ -571,21 +595,41 @@ def analyze_match_results_video(
                 )
             )
 
-            _log(
-                logger,
-                "info",
-                f"Analyzing result screen with {model}, media_resolution=HIGH, video_sample_fps={video_sample_fps}.",
-            )
-            response = _generate_content_with_retry(
-                client,
-                model=model,
-                config=_build_generate_config(),
-                contents=types.Content(role="user", parts=parts),
-                max_retries=max_retries,
-                base_delay_seconds=retry_base_delay,
-                max_delay_seconds=retry_max_delay,
-                logger=logger,
-            )
+            models_to_try = _ordered_models(model)
+            response = None
+            for model_index, candidate_model in enumerate(models_to_try):
+                _log(
+                    logger,
+                    "info",
+                    f"Analyzing result screen with {candidate_model}, "
+                    f"media_resolution=HIGH, video_sample_fps={video_sample_fps}.",
+                )
+                try:
+                    response = _generate_content_with_retry(
+                        client,
+                        model=candidate_model,
+                        config=_build_generate_config(),
+                        contents=types.Content(role="user", parts=parts),
+                        max_retries=max_retries,
+                        base_delay_seconds=retry_base_delay,
+                        max_delay_seconds=retry_max_delay,
+                        logger=logger,
+                    )
+                    if candidate_model != model:
+                        _log(logger, "info", f"Gemini fallback model succeeded: {candidate_model}")
+                    break
+                except Exception as exc:
+                    if not _is_rate_limit_error(exc) or model_index == len(models_to_try) - 1:
+                        raise
+                    next_model = models_to_try[model_index + 1]
+                    _log(
+                        logger,
+                        "warning",
+                        f"Gemini model {candidate_model} is rate limited; trying fallback model {next_model}.",
+                    )
+
+            if response is None:
+                raise RuntimeError("Gemini did not return a response from any configured model")
 
             match_stats = _parse_response(response)
             player_stats = _to_downstream_player_stats(match_stats)
