@@ -195,6 +195,7 @@ class SmashBrosProcessor:
         self.frame_skip_interval = 1  # Keep every result-screen frame by default.
         self.frame_30_image = None  # Store frame 42 (~1.4 seconds at 30fps) for player identification
         self.current_frame_30_image_path = None  # Path to saved frame 42 image file
+        self.post_processing_lock = threading.Lock()
         
         # Create output directory
         if not os.path.exists(self.output_dir):
@@ -634,6 +635,66 @@ class SmashBrosProcessor:
 
         return self.recording_written_frames / elapsed_seconds
 
+    def post_process_match_recording(
+        self,
+        match_filepath: Optional[str],
+        recording_frames: List[np.ndarray],
+        recording_game_end_scores: List[float],
+        frame_30_image: Optional[np.ndarray],
+        effective_fps: Optional[float],
+        writer_fps: float,
+        recording_written_frames: int,
+    ):
+        """
+        Run all slow post-recording work off the capture loop.
+        """
+        post_processing_lock = getattr(self, "post_processing_lock", None)
+        lock_acquired = False
+        extraction_fps = writer_fps
+
+        try:
+            if post_processing_lock:
+                post_processing_lock.acquire()
+                lock_acquired = True
+
+            if effective_fps and writer_fps > 0:
+                fps_delta = abs(effective_fps - writer_fps) / writer_fps
+                self.logger.info(
+                    f"Recording wrote {recording_written_frames} frame(s) at "
+                    f"{effective_fps:.2f} effective fps (writer fps: {writer_fps})."
+                )
+                if fps_delta > 0.05:
+                    self.logger.warning(
+                        f"Recorded frame rate differed from writer fps by {fps_delta:.0%}; "
+                        f"correcting MP4 playback speed to {effective_fps:.2f} fps."
+                    )
+                    if match_filepath:
+                        self.rewrite_video_with_fps(match_filepath, effective_fps)
+                    extraction_fps = effective_fps
+
+            if match_filepath:
+                self.compress_video_to_target_size(match_filepath)
+
+            self.extract_result_screens(
+                recording_frames=recording_frames,
+                recording_game_end_scores=recording_game_end_scores,
+                frame_30_image=frame_30_image,
+                match_filepath=match_filepath,
+                source_fps=extraction_fps,
+                process_results_in_background=False,
+            )
+
+            self.cleanup_old_matches()
+        except Exception as e:
+            self.logger.error(f"Error during match post-processing: {e}")
+        finally:
+            recording_frames.clear()
+            recording_game_end_scores.clear()
+            import gc
+            gc.collect()
+            if lock_acquired:
+                post_processing_lock.release()
+
     def rewrite_video_with_fps(self, filepath: str, output_fps: float) -> bool:
         if output_fps <= 0 or not os.path.exists(filepath):
             return False
@@ -861,42 +922,48 @@ class SmashBrosProcessor:
             self.logger.info("Stopped recording")
 
             effective_fps = self.get_effective_recording_fps()
-            extraction_fps = self.fps
-            if effective_fps and self.fps > 0:
-                fps_delta = abs(effective_fps - self.fps) / self.fps
-                self.logger.info(
-                    f"Recording wrote {self.recording_written_frames} frame(s) at "
-                    f"{effective_fps:.2f} effective fps (writer fps: {self.fps})."
-                )
-                if fps_delta > 0.05:
-                    self.logger.warning(
-                        f"Recorded frame rate differed from writer fps by {fps_delta:.0%}; "
-                        f"correcting MP4 playback speed to {effective_fps:.2f} fps."
-                    )
-                    if self.current_match_filepath:
-                        self.rewrite_video_with_fps(self.current_match_filepath, effective_fps)
-                    extraction_fps = effective_fps
-            self.current_recording_effective_fps = extraction_fps
+            match_filepath = self.current_match_filepath
+            writer_fps = self.fps
+            recording_written_frames = self.recording_written_frames
+            recording_frames = self.recording_frames
+            recording_game_end_scores = self.recording_game_end_scores
+            frame_30_image = self.frame_30_image.copy() if self.frame_30_image is not None else None
 
-            if self.current_match_filepath:
-                self.compress_video_to_target_size(self.current_match_filepath)
-            
-            # Extract result screens if we have recorded frames
-            previous_fps = self.fps
-            self.fps = extraction_fps
-            try:
-                self.extract_result_screens()
-            finally:
-                self.fps = previous_fps
-            
-            # Clear frame buffers to free memory
+            # Hand ownership of the just-finished match buffers to the worker
+            # and leave the capture loop ready to detect the next match.
+            self.recording_frames = []
+            self.recording_game_end_scores = []
+            self.recording_start_time = None
+            self.recording_written_frames = 0
+            self.current_recording_effective_fps = None
+            self.frame_skip_count = 0
+            self.frame_30_image = None
+            self.current_frame_30_image_path = None
             self.clear_frame_buffers()
             
             self.match_counter += 1
             self.current_match_id = None  # Reset match ID for next match
-            
-            # Cleanup old matches (automatic 30-day retention)
-            self.cleanup_old_matches()
+
+            post_process_args = (
+                match_filepath,
+                recording_frames,
+                recording_game_end_scores,
+                frame_30_image,
+                effective_fps,
+                writer_fps,
+                recording_written_frames,
+            )
+
+            if self.test_mode:
+                self.post_process_match_recording(*post_process_args)
+            else:
+                post_process_thread = threading.Thread(
+                    target=self.post_process_match_recording,
+                    args=post_process_args,
+                    daemon=True,
+                )
+                post_process_thread.start()
+                self.logger.info("Match post-processing started in background thread")
 
     def get_disk_free_bytes(self):
         """
@@ -1060,7 +1127,18 @@ class SmashBrosProcessor:
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
 
-    def save_result_screen_debug_artifacts(self, result_frames, best_frame_index, best_confidence, reason):
+    def save_result_screen_debug_artifacts(
+        self,
+        result_frames,
+        best_frame_index,
+        best_confidence,
+        reason,
+        match_filepath=None,
+        frame_30_image=None,
+        source_fps=None,
+        recording_frame_count=None,
+        allow_current_frame_fallback=True,
+    ):
         """
         Save enough context to inspect result-screen detections that were too short
         for normal Gemini processing.
@@ -1075,14 +1153,14 @@ class SmashBrosProcessor:
 
             has_space = self.ensure_free_disk_space(
                 "writing result screen diagnostic",
-                excluded_paths=[self.current_match_filepath, video_path],
+                excluded_paths=[match_filepath, self.current_match_filepath, video_path],
             )
 
             if not has_space:
                 self.logger.error("Skipping result screen diagnostic because disk space is still below the configured minimum")
                 return None
 
-            result_fps = self.get_result_screen_output_fps()
+            result_fps = self.get_result_screen_output_fps(source_fps)
             height, width = result_frames[0].shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(video_path, fourcc, result_fps, (width, height))
@@ -1096,25 +1174,27 @@ class SmashBrosProcessor:
                 video_path = None
 
             frame_42_path = None
-            if self.frame_30_image is not None:
+            if frame_30_image is None and allow_current_frame_fallback:
+                frame_30_image = self.frame_30_image
+            if frame_30_image is not None:
                 frame_42_path = os.path.join(self.result_screens_dir, f"{base_name}_frame_42.png")
-                cv2.imwrite(frame_42_path, self.frame_30_image)
+                cv2.imwrite(frame_42_path, frame_30_image)
 
             manifest_path = os.path.join(self.result_screens_dir, f"{base_name}_debug.json")
             manifest = {
                 "reason": reason,
                 "created_at": datetime.datetime.now().isoformat(),
                 "frame_count": len(result_frames),
-                "minimum_required_frames": self.get_min_result_screen_frames(),
-                "source_fps": self.fps,
+                "minimum_required_frames": self.get_min_result_screen_frames(source_fps),
+                "source_fps": source_fps or self.fps,
                 "output_fps": result_fps,
                 "frame_skip_interval": self.frame_skip_interval,
                 "duration_seconds": len(result_frames) / result_fps if result_fps > 0 else None,
                 "best_frame_index": int(best_frame_index),
                 "best_confidence": float(best_confidence),
-                "recording_frame_count": len(self.recording_frames),
+                "recording_frame_count": recording_frame_count if recording_frame_count is not None else len(self.recording_frames),
                 "current_frame_number": self.current_frame_number,
-                "current_match_filepath": self.current_match_filepath,
+                "current_match_filepath": match_filepath or self.current_match_filepath,
                 "video_path": video_path,
                 "frame_42_path": frame_42_path,
                 "game_end_confidence_threshold": self.game_end_confidence_threshold,
@@ -1131,39 +1211,60 @@ class SmashBrosProcessor:
             self.logger.error(f"Failed to save result screen diagnostic: {e}")
             return None
 
-    def get_result_screen_output_fps(self):
+    def get_result_screen_output_fps(self, source_fps=None):
         """
         Result frames are sampled every frame_skip_interval frames. Write clips at
         the effective FPS so the saved result-screen video reflects real time.
         """
-        if self.fps <= 0:
+        fps = source_fps if source_fps is not None else self.fps
+        if fps <= 0:
             return 30
 
-        return max(1, self.fps / max(1, self.frame_skip_interval))
+        return max(1, fps / max(1, self.frame_skip_interval))
 
-    def get_min_result_screen_frames(self):
+    def get_min_result_screen_frames(self, source_fps=None):
         """
         Require about 0.5 seconds of result-screen footage after downsampling.
         """
-        return max(1, math.ceil(0.5 * self.get_result_screen_output_fps()))
+        return max(1, math.ceil(0.5 * self.get_result_screen_output_fps(source_fps)))
     
-    def extract_result_screens(self):
+    def extract_result_screens(
+        self,
+        recording_frames=None,
+        recording_game_end_scores=None,
+        frame_30_image=None,
+        match_filepath=None,
+        source_fps=None,
+        process_results_in_background=True,
+    ):
         """
         Extract and save result screen frames from the recorded match
         """
-        if not self.recording_frames or not self.recording_game_end_scores:
+        using_current_recording = recording_frames is None and recording_game_end_scores is None
+        if recording_frames is None:
+            recording_frames = self.recording_frames
+        if recording_game_end_scores is None:
+            recording_game_end_scores = self.recording_game_end_scores
+        if frame_30_image is None and using_current_recording:
+            frame_30_image = self.frame_30_image
+        if match_filepath is None:
+            match_filepath = self.current_match_filepath
+        if source_fps is None:
+            source_fps = self.fps
+
+        if not recording_frames or not recording_game_end_scores:
             self.logger.warning("No recorded frames or game end scores to process for result screens")
-            return
+            return None, None
         
-        self.logger.info(f"Analyzing {len(self.recording_frames)} recorded frames for result screen extraction...")
+        self.logger.info(f"Analyzing {len(recording_frames)} recorded frames for result screen extraction...")
         
         # Find the last frame with highest game end confidence above threshold
         best_frame_index = -1
         best_confidence = 0.0
         
         # Search backwards through the scores to find the last frame with high confidence
-        for i in range(len(self.recording_game_end_scores) - 1, -1, -1):
-            confidence = self.recording_game_end_scores[i]
+        for i in range(len(recording_game_end_scores) - 1, -1, -1):
+            confidence = recording_game_end_scores[i]
             if confidence >= self.game_end_confidence_threshold and confidence > best_confidence:
                 best_confidence = confidence
                 best_frame_index = i
@@ -1171,12 +1272,12 @@ class SmashBrosProcessor:
         
         if best_frame_index == -1:
             self.logger.warning("No frame found with game end confidence above threshold for result screens")
-            return
+            return None, None
         
         # Extract frames from the best frame to the end
-        result_frames = self.recording_frames[best_frame_index:]
+        result_frames = recording_frames[best_frame_index:]
         
-        min_result_screen_frames = self.get_min_result_screen_frames()
+        min_result_screen_frames = self.get_min_result_screen_frames(source_fps)
         if len(result_frames) < min_result_screen_frames:
             self.logger.warning(
                 f"Result screen sequence too short ({len(result_frames)} frames, minimum {min_result_screen_frames}), skipping"
@@ -1186,8 +1287,13 @@ class SmashBrosProcessor:
                 best_frame_index,
                 best_confidence,
                 reason=f"result screen sequence too short ({len(result_frames)} frames, minimum {min_result_screen_frames})",
+                match_filepath=match_filepath,
+                frame_30_image=frame_30_image,
+                source_fps=source_fps,
+                recording_frame_count=len(recording_frames),
+                allow_current_frame_fallback=using_current_recording,
             )
-            return
+            return None, None
         
         # Create result screen video filename
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1195,26 +1301,26 @@ class SmashBrosProcessor:
         result_filename = f"{timestamp}_result_screen.mp4"
         result_filepath = os.path.join(self.result_screens_dir, result_filename)
         
-        # Store result screen filepath for potential renaming
-        self.current_result_screen_filepath = result_filepath
+        if match_filepath == self.current_match_filepath:
+            self.current_result_screen_filepath = result_filepath
 
         has_space = self.ensure_free_disk_space(
             "writing result screen video",
-            excluded_paths=[self.current_match_filepath, result_filepath],
+            excluded_paths=[match_filepath, self.current_match_filepath, result_filepath],
         )
 
         if not has_space:
             self.logger.error("Skipping result screen extraction because disk space is still below the configured minimum")
-            return
+            return None, None
         
         # Create video writer for result screens
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        result_fps = self.get_result_screen_output_fps()
+        result_fps = self.get_result_screen_output_fps(source_fps)
         result_out = cv2.VideoWriter(result_filepath, fourcc, result_fps, (self.width, self.height))
         
         if not result_out.isOpened():
             self.logger.warning(f"Failed to create result screen video writer for {result_filepath}")
-            return
+            return None, None
         
         # Write result screen frames
         for frame in result_frames:
@@ -1225,11 +1331,11 @@ class SmashBrosProcessor:
         # Save frame 42 image if available (for player identification)
         # Save it with the same base name as the result screen video for easy matching
         frame_30_image_path = None
-        if self.frame_30_image is not None:
+        if frame_30_image is not None:
             # Use the same base name as the result screen video
             result_base_name = os.path.splitext(result_filename)[0]  # Remove .mp4 extension
             frame_30_image_path = os.path.join(self.result_screens_dir, f"{result_base_name}_frame_42.png")
-            cv2.imwrite(frame_30_image_path, self.frame_30_image)
+            cv2.imwrite(frame_30_image_path, frame_30_image)
             self.logger.info(f"Saved frame 42 image: {os.path.basename(frame_30_image_path)}")
         
         # Calculate duration
@@ -1237,40 +1343,60 @@ class SmashBrosProcessor:
         
         self.logger.info(f"Saved result screens: {result_filename}")
         self.logger.info(f"  Duration: {duration_seconds:.2f} seconds ({len(result_frames)} frames)")
-        self.logger.info(f"  Output FPS: {result_fps:.2f} (source FPS: {self.fps}, frame skip: {self.frame_skip_interval})")
+        self.logger.info(f"  Output FPS: {result_fps:.2f} (source FPS: {source_fps}, frame skip: {self.frame_skip_interval})")
         self.logger.info(f"  Starting from frame with confidence: {best_confidence:.3f}")
-        self.logger.info(f"  Frame index in match: {best_frame_index}/{len(self.recording_frames)-1}")
+        self.logger.info(f"  Frame index in match: {best_frame_index}/{len(recording_frames)-1}")
         
-        # Store frame 42 image path for use in get_match_stats
-        self.current_frame_30_image_path = frame_30_image_path
+        if match_filepath == self.current_match_filepath:
+            self.current_frame_30_image_path = frame_30_image_path
         
         # Extract player stats and save to database (only when NOT in test mode)
         if not self.test_mode:
-            # Run match stats processing in background thread to avoid blocking frame processing
-            def process_match_results_background():
-                try:
-                    print("\nProcessing match results in background...")
-                    
-                    # Extract player stats using Gemini API
-                    match_stats = self.get_match_stats(result_filepath)
-                    
-                    if match_stats and match_stats[0].is_online_match == False:
-                        # Add metadata to result screen video
-                        if os.path.exists(result_filepath):
-                            participant_names = [stat.player_name for stat in match_stats]
-                            self.add_metadata_to_mp4(result_filepath, participant_names)
-                        
-                        # Save match stats to database (match will be created here if eligible)
-                        self.save_match_stats(match_stats)
-                    else:
-                        print("Failed to extract match stats, skipping database save")
-                except Exception as e:
-                    print(f"Error in background match processing: {e}")
-            
-            # Start background thread
-            background_thread = threading.Thread(target=process_match_results_background, daemon=True)
-            background_thread.start()
-            print("Match results processing started in background thread")
+            if process_results_in_background:
+                background_thread = threading.Thread(
+                    target=self.process_match_results,
+                    args=(result_filepath, frame_30_image_path, result_fps, match_filepath),
+                    daemon=True,
+                )
+                background_thread.start()
+                print("Match results processing started in background thread")
+            else:
+                self.process_match_results(result_filepath, frame_30_image_path, result_fps, match_filepath)
+
+        return result_filepath, frame_30_image_path
+
+    def process_match_results(
+        self,
+        result_filepath: str,
+        frame_30_image_path: Optional[str],
+        result_fps: float,
+        match_filepath: Optional[str],
+    ):
+        try:
+            print("\nProcessing match results in background...")
+
+            match_stats = self.get_match_stats(
+                result_filepath,
+                context_image_path=frame_30_image_path,
+                output_fps=result_fps,
+                use_current_context_image=False,
+            )
+
+            if match_stats and match_stats[0].is_online_match == False:
+                if os.path.exists(result_filepath):
+                    participant_names = [stat.player_name for stat in match_stats]
+                    self.add_metadata_to_mp4(result_filepath, participant_names)
+
+                self.save_match_stats(
+                    match_stats,
+                    match_filepath=match_filepath,
+                    result_screen_filepath=result_filepath,
+                    frame_30_image_path=frame_30_image_path,
+                )
+            else:
+                print("Failed to extract match stats, skipping database save")
+        except Exception as e:
+            print(f"Error in background match processing: {e}")
     
     def process_frame(self, frame):
         """
@@ -1628,7 +1754,14 @@ class SmashBrosProcessor:
             return fallback
 
 
-    def get_match_stats(self, match_results_video_filepath: str, slowdown_factor: int = None) -> Optional[List[PlayerStats]]:
+    def get_match_stats(
+        self,
+        match_results_video_filepath: str,
+        slowdown_factor: int = None,
+        context_image_path: Optional[str] = None,
+        output_fps: Optional[float] = None,
+        use_current_context_image: bool = True,
+    ) -> Optional[List[PlayerStats]]:
         """
         Extract player stats from a match results video using Gemini API
         Includes frame 42 (~1.4 seconds into match) image to help identify players
@@ -1645,13 +1778,16 @@ class SmashBrosProcessor:
             self.logger.info(f"Extracting player stats from result screen video: {match_results_video_filepath}")
             self.logger.info(f"Using Gemini model: {gemini_model}")
             self.logger.info(f"Using video slowdown factor: {slowdown_factor}x")
+            context_image = context_image_path
+            if context_image is None and use_current_context_image:
+                context_image = getattr(self, 'current_frame_30_image_path', None)
 
             return analyze_match_results_video(
                 gemini_client,
                 match_results_video_filepath,
-                context_image_path=getattr(self, 'current_frame_30_image_path', None),
+                context_image_path=context_image,
                 slowdown_factor=slowdown_factor,
-                output_fps=self.fps,
+                output_fps=output_fps if output_fps is not None else self.fps,
                 model=gemini_model,
                 logger=self.logger,
                 player_name_examples=self.get_player_name_examples(),
@@ -1699,7 +1835,14 @@ class SmashBrosProcessor:
             print(f"Error creating match: {e}")
             return None
         
-    def save_match_stats(self, stats: List[PlayerStats], match_id: Optional[int] = None):
+    def save_match_stats(
+        self,
+        stats: List[PlayerStats],
+        match_id: Optional[int] = None,
+        match_filepath: Optional[str] = None,
+        result_screen_filepath: Optional[str] = None,
+        frame_30_image_path: Optional[str] = None,
+    ):
         """Save match stats to the database"""
         print(stats)
         if not self.supabase_client:
@@ -1744,7 +1887,12 @@ class SmashBrosProcessor:
                 return
             
             # Rename files to include match ID
-            self.rename_match_files(match_id)
+            match_filepath, result_screen_filepath, frame_30_image_path = self.rename_match_files(
+                match_id,
+                match_filepath=match_filepath,
+                result_screen_filepath=result_screen_filepath,
+                frame_30_image_path=frame_30_image_path,
+            )
             
             players = []
             winners = []
@@ -1928,9 +2076,9 @@ class SmashBrosProcessor:
             print("="*60)
             
             # Add metadata to match video file
-            if self.current_match_filepath and os.path.exists(self.current_match_filepath):
+            if match_filepath and os.path.exists(match_filepath):
                 participant_names = [stat.player_name for stat in stats]
-                self.add_metadata_to_mp4(self.current_match_filepath, participant_names)
+                self.add_metadata_to_mp4(match_filepath, participant_names)
             
             # YouTube upload disabled. Videos stay saved locally under the output directory.
             # if self.current_match_filepath and os.path.exists(self.current_match_filepath):
@@ -1970,56 +2118,85 @@ class SmashBrosProcessor:
         except Exception as e:
             print(f"Error saving match stats: {e}")
     
-    def rename_match_files(self, match_id: int):
+    def rename_match_files(
+        self,
+        match_id: int,
+        match_filepath: Optional[str] = None,
+        result_screen_filepath: Optional[str] = None,
+        frame_30_image_path: Optional[str] = None,
+    ):
         """
         Rename match files to include match ID if they exist
         Format: {match_id}-{timestamp}.mp4
         """
+        match_filepath = match_filepath or self.current_match_filepath
+        result_screen_filepath = result_screen_filepath or self.current_result_screen_filepath
+        frame_30_image_path = frame_30_image_path or self.current_frame_30_image_path
+
         try:
             # Rename main match file
-            if self.current_match_filepath and os.path.exists(self.current_match_filepath):
-                old_path = self.current_match_filepath
+            if match_filepath and os.path.exists(match_filepath):
+                old_path = match_filepath
                 old_dir = os.path.dirname(old_path)
                 old_filename = os.path.basename(old_path)
                 
                 # Extract timestamp from old filename (format: YYYYMMDD_HHMMSS.mp4)
                 if old_filename.endswith('.mp4'):
                     timestamp_part = old_filename[:-4]  # Remove .mp4
-                    new_filename = f"{match_id}-{timestamp_part}.mp4"
+                    if not timestamp_part.startswith(f"{match_id}-"):
+                        new_filename = f"{match_id}-{timestamp_part}.mp4"
+                    else:
+                        new_filename = old_filename
                     new_path = os.path.join(old_dir, new_filename)
                     
                     if old_path != new_path:
                         os.rename(old_path, new_path)
-                        self.current_match_filepath = new_path
+                        match_filepath = new_path
+                        if old_path == self.current_match_filepath:
+                            self.current_match_filepath = new_path
                         self.logger.info(f"Renamed match file: {old_filename} -> {new_filename}")
             
             # Rename result screen file
-            if self.current_result_screen_filepath and os.path.exists(self.current_result_screen_filepath):
-                old_path = self.current_result_screen_filepath
+            if result_screen_filepath and os.path.exists(result_screen_filepath):
+                old_path = result_screen_filepath
                 old_dir = os.path.dirname(old_path)
                 old_filename = os.path.basename(old_path)
                 
                 # Extract timestamp from old filename (format: YYYYMMDD_HHMMSS_result_screen.mp4)
                 if old_filename.endswith('_result_screen.mp4'):
-                    timestamp_part = old_filename[:-17]  # Remove _result_screen.mp4
-                    new_filename = f"{match_id}-{timestamp_part}_result_screen.mp4"
+                    timestamp_part = old_filename[:-len('_result_screen.mp4')]
+                    if not timestamp_part.startswith(f"{match_id}-"):
+                        new_filename = f"{match_id}-{timestamp_part}_result_screen.mp4"
+                    else:
+                        new_filename = old_filename
                     new_path = os.path.join(old_dir, new_filename)
                     
                     if old_path != new_path:
                         os.rename(old_path, new_path)
-                        self.current_result_screen_filepath = new_path
+                        result_screen_filepath = new_path
+                        if old_path == self.current_result_screen_filepath:
+                            self.current_result_screen_filepath = new_path
                         self.logger.info(f"Renamed result screen file: {old_filename} -> {new_filename}")
                         
-                        # Also rename the frame 42 image if it exists (should have same base name)
+                    # Also rename the frame 42 image if it exists (should have same base name)
+                    if frame_30_image_path and os.path.exists(frame_30_image_path):
+                        frame_30_old_path = frame_30_image_path
+                    else:
                         frame_30_old_path = os.path.join(old_dir, f"{timestamp_part}_result_screen_frame_42.png")
-                        if os.path.exists(frame_30_old_path):
-                            frame_30_new_path = os.path.join(old_dir, f"{match_id}-{timestamp_part}_result_screen_frame_42.png")
+
+                    if os.path.exists(frame_30_old_path):
+                        frame_30_new_path = os.path.join(old_dir, f"{os.path.splitext(new_filename)[0]}_frame_42.png")
+                        if frame_30_old_path != frame_30_new_path:
                             os.rename(frame_30_old_path, frame_30_new_path)
-                            self.current_frame_30_image_path = frame_30_new_path
+                            frame_30_image_path = frame_30_new_path
+                            if frame_30_old_path == self.current_frame_30_image_path:
+                                self.current_frame_30_image_path = frame_30_new_path
                             self.logger.info(f"Renamed frame 42 image: {os.path.basename(frame_30_old_path)} -> {os.path.basename(frame_30_new_path)}")
                         
         except Exception as e:
             self.logger.error(f"Error renaming match files: {e}")
+
+        return match_filepath, result_screen_filepath, frame_30_image_path
     
     def add_metadata_to_mp4(self, filepath: str, participants: List[str]):
         """Add participant names to MP4 file metadata"""
