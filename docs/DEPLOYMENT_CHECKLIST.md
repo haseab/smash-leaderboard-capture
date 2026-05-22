@@ -123,6 +123,9 @@ uv run python capture_card_processor.py --test-mode --test-video-path path\to\te
 
 # Live mode (requires capture card)
 uv run python capture_card_processor.py
+
+# Live mode with capture-card audio
+uv run python capture_card_processor.py --audio-device "EVGA XR1 Capture Box Audio"
 ```
 
 ---

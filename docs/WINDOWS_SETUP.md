@@ -176,6 +176,29 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+### 6. Configure Capture Card Audio (Optional)
+
+Audio capture uses ffmpeg DirectShow on Windows. Install ffmpeg first if it is not already on PATH, then list available audio devices:
+
+```powershell
+ffmpeg -list_devices true -f dshow -i dummy
+```
+
+Use the exact audio device name reported by ffmpeg:
+
+```powershell
+uv run python capture_card_processor.py --audio-device "EVGA XR1 Capture Box Audio"
+```
+
+For production, set the same value in `.env`:
+
+```powershell
+CAPTURE_AUDIO_DEVICE=EVGA XR1 Capture Box Audio
+CAPTURE_AUDIO_BACKEND=dshow
+```
+
+If no audio device is configured, the processor records video-only and logs that audio capture is disabled.
+
 ---
 
 ## 🎮 Running on Windows

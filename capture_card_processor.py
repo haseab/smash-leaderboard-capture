@@ -10,8 +10,11 @@ import json
 from enum import Enum
 import math
 import logging
+from logging.handlers import RotatingFileHandler
 import subprocess
 import shutil
+import sys
+import traceback
 from typing import List, Optional, Dict, Tuple
 import pandas as pd
 import pytz
@@ -39,6 +42,174 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_OUTPUT_DIR = os.path.join("local", "matches")
+STARTUP_LOG_MESSAGES = []
+CURRENT_LOG_FILEPATH = None
+
+
+def get_default_audio_backend():
+    if sys.platform.startswith("win"):
+        return "dshow"
+    if sys.platform == "darwin":
+        return "avfoundation"
+    if sys.platform.startswith("linux"):
+        return "pulse"
+    return "dshow"
+
+
+def tail_process_output(output, max_lines=20):
+    if not output:
+        return ""
+
+    lines = [line for line in output.strip().splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+class StreamToLogger:
+    """
+    File-like stream that sends print output and tracebacks through logging.
+    """
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+        self._buffer = ""
+
+    def write(self, message):
+        if message is None:
+            return 0
+
+        message = str(message)
+        self._buffer += message
+
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self.logger.log(self.level, line.rstrip())
+
+        return len(message)
+
+    def flush(self):
+        if self._buffer:
+            self.logger.log(self.level, self._buffer.rstrip())
+            self._buffer = ""
+
+
+class PrefixedMultilineFormatter(logging.Formatter):
+    """
+    Formatter that repeats the timestamp/level/process/thread/logger prefix on
+    traceback continuation lines instead of leaving raw multiline output.
+    """
+    def format(self, record):
+        formatted = super().format(record)
+        if "\n" not in formatted:
+            return formatted
+
+        continuation_prefix = (
+            f"{self.formatTime(record, self.datefmt)}.{int(record.msecs):03d} "
+            f"[{record.levelname:<8}] "
+            f"[pid={record.process}] "
+            f"[thread={record.threadName}] "
+            f"[{record.name}] "
+        )
+        lines = formatted.splitlines()
+        return "\n".join([lines[0], *[f"{continuation_prefix}{line}" for line in lines[1:]]])
+
+
+def log_section(logger, title):
+    logger.info("")
+    logger.info("")
+    logger.info("=" * 96)
+    logger.info(title)
+    logger.info("=" * 96)
+
+
+def write_image_or_log(logger, filepath, image, description):
+    try:
+        if not cv2.imwrite(filepath, image):
+            logger.error(f"Failed to write {description}: {filepath}")
+            return False
+        return True
+    except Exception as e:
+        logger.exception(f"Error writing {description} to {filepath}: {e}")
+        return False
+
+
+def configure_capture_logging(output_dir):
+    global CURRENT_LOG_FILEPATH
+
+    output_dir = os.path.abspath(os.path.normpath(output_dir))
+    os.makedirs(output_dir, exist_ok=True)
+    log_filepath = os.path.join(output_dir, "smash_capture.log")
+    if CURRENT_LOG_FILEPATH == log_filepath and logging.getLogger().handlers:
+        return log_filepath
+
+    formatter = PrefixedMultilineFormatter(
+        fmt=(
+            "%(asctime)s.%(msecs)03d "
+            "[%(levelname)-8s] "
+            "[pid=%(process)d] "
+            "[thread=%(threadName)s] "
+            "[%(name)s] "
+            "%(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = RotatingFileHandler(
+        log_filepath,
+        mode="a",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler(sys.__stdout__)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        handler.close()
+
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    logging.getLogger('google.auth.transport.requests').setLevel(logging.WARNING)
+    logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+    logging.captureWarnings(True)
+
+    stdout_logger = logging.getLogger("stdout")
+    stderr_logger = logging.getLogger("stderr")
+    sys.stdout = StreamToLogger(stdout_logger, logging.INFO)
+    sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
+
+    def log_uncaught_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+
+        logging.getLogger(__name__).critical(
+            "Uncaught exception; capture process is exiting",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    sys.excepthook = log_uncaught_exception
+
+    if hasattr(threading, "excepthook"):
+        def log_thread_exception(args):
+            logging.getLogger(__name__).critical(
+                f"Uncaught exception in thread {args.thread.name}",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+        threading.excepthook = log_thread_exception
+
+    CURRENT_LOG_FILEPATH = log_filepath
+    return log_filepath
 
 class GameState(Enum):
     WAITING = "waiting"
@@ -51,7 +222,11 @@ try:
     gemini_client = create_gemini_client()
     gemini_model = get_gemini_model()
 except Exception as e:
-    print(f"Warning: Failed to initialize Gemini client: {e}")
+    STARTUP_LOG_MESSAGES.append((
+        "warning",
+        f"Failed to initialize Gemini client: {e}",
+        traceback.format_exc(),
+    ))
     gemini_client = None
     gemini_model = DEFAULT_GEMINI_MODEL
 
@@ -65,15 +240,20 @@ try:
     
     supabase_client: Client = create_client(supabase_url, supabase_key)
 except Exception as e:
-    print(f"Warning: Failed to initialize Supabase client: {e}")
+    STARTUP_LOG_MESSAGES.append((
+        "warning",
+        f"Failed to initialize Supabase client: {e}",
+        traceback.format_exc(),
+    ))
     supabase_client = None
 
 
 def invalidate_frontend_cache():
     """Invalidate the frontend cache after a match is saved"""
+    logger = logging.getLogger(__name__)
     frontend_url = os.getenv("FRONTEND_URL")
     if not frontend_url:
-        print("FRONTEND_URL not set, skipping cache invalidation")
+        logger.warning("FRONTEND_URL not set, skipping cache invalidation")
         return
 
     tags = ["players", "matches"]
@@ -84,11 +264,11 @@ def invalidate_frontend_cache():
             timeout=10
         )
         if response.ok:
-            print(f"Frontend cache invalidated: {response.json()}")
+            logger.info(f"Frontend cache invalidated: {response.json()}")
         else:
-            print(f"Failed to invalidate cache: {response.status_code} - {response.text}")
+            logger.warning(f"Failed to invalidate cache: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"Failed to invalidate frontend cache: {e}")
+        logger.exception(f"Failed to invalidate frontend cache: {e}")
 
 
 class SmashBrosProcessor:
@@ -96,7 +276,9 @@ class SmashBrosProcessor:
                  center_region_top=0.3, center_region_bottom=0.7, center_region_left=0.1, center_region_right=0.9,
                  game_region_top=0.1, game_region_bottom=0.5, game_region_left=0.2, game_region_right=0.8,
                  consecutive_black_threshold_secs=0.5, play_video=False, video_slowdown_factor=10,
-                 rolling_window_days=30, min_free_space_gb=5.0, target_video_size_mb=100.0):
+                 rolling_window_days=30, min_free_space_gb=5.0, target_video_size_mb=100.0,
+                 audio_enabled=True, audio_device=None, audio_backend=None,
+                 audio_sample_rate=None, audio_channels=None, audio_bitrate=None):
         """
         Initialize the Smash Bros match processor
         
@@ -119,6 +301,12 @@ class SmashBrosProcessor:
             rolling_window_days: Number of days to keep match files. Files older than this will be automatically deleted. Default: 30 days.
             min_free_space_gb: Minimum free disk space to keep before starting new video writes. Deletes oldest match files when below this threshold. Default: 5 GB.
             target_video_size_mb: Target size for saved full-match videos after recording. Set to 0 to disable compression.
+            audio_enabled: Whether to capture audio during live recording.
+            audio_device: ffmpeg audio input device name. Defaults to CAPTURE_AUDIO_DEVICE.
+            audio_backend: ffmpeg input backend. Defaults to CAPTURE_AUDIO_BACKEND or the platform default.
+            audio_sample_rate: Output audio sample rate. Defaults to CAPTURE_AUDIO_SAMPLE_RATE or 48000.
+            audio_channels: Output channel count. Defaults to CAPTURE_AUDIO_CHANNELS or 2.
+            audio_bitrate: AAC bitrate used when muxing/compressing. Defaults to CAPTURE_AUDIO_BITRATE or 160k.
         """
         self.device_index = device_index
         self.output_dir = os.path.normpath(output_dir)
@@ -129,6 +317,14 @@ class SmashBrosProcessor:
         self.rolling_window_days = rolling_window_days
         self.min_free_space_bytes = int(min_free_space_gb * 1024 * 1024 * 1024) if min_free_space_gb and min_free_space_gb > 0 else 0
         self.target_video_size_mb = max(0.0, float(target_video_size_mb or 0.0))
+        self.audio_enabled = bool(audio_enabled)
+        self.audio_device = audio_device or os.getenv("CAPTURE_AUDIO_DEVICE")
+        if self.audio_device:
+            self.audio_device = self.audio_device.strip().strip("\"'")
+        self.audio_backend = (audio_backend or os.getenv("CAPTURE_AUDIO_BACKEND") or get_default_audio_backend()).lower()
+        self.audio_sample_rate = int(audio_sample_rate or os.getenv("CAPTURE_AUDIO_SAMPLE_RATE") or 48000)
+        self.audio_channels = int(audio_channels or os.getenv("CAPTURE_AUDIO_CHANNELS") or 2)
+        self.audio_bitrate = audio_bitrate or os.getenv("CAPTURE_AUDIO_BITRATE") or "160k"
         
         # Region boundaries (as fractions of frame dimensions)
         self.center_region_top = center_region_top
@@ -175,6 +371,10 @@ class SmashBrosProcessor:
         self.recording_start_time = None
         self.recording_written_frames = 0
         self.current_recording_effective_fps = None
+        self.audio_capture_process = None
+        self.current_audio_filepath = None
+        self.audio_capture_started_at = None
+        self.audio_stop_timeout_secs = 10
         
         # Test mode tracking
         self.current_frame_number = 0
@@ -214,33 +414,35 @@ class SmashBrosProcessor:
     
     def setup_logging(self):
         """Setup logging to file and console"""
-        # Use a fixed log filename that gets overwritten each time
-        log_filename = "smash_capture.log"
-        log_filepath = os.path.join(self.output_dir, log_filename)
-        
-        # Setup logging configuration with mode='w' to overwrite the file
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_filepath, mode='w'),  # 'w' mode overwrites the file
-                logging.StreamHandler()  # Also log to console
-            ],
-            force=True  # Force reconfiguration if already configured
-        )
-        
-        # Suppress verbose HTTP logging from Google API client
-        logging.getLogger('google.auth.transport.requests').setLevel(logging.WARNING)
-        logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
-        
+        log_filepath = configure_capture_logging(self.output_dir)
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"Smash Bros Capture Processor started - Log file: {log_filename}")
+
+        log_section(self.logger, "SMASH CAPTURE SESSION START")
+        self.logger.info(f"Log file: {log_filepath}")
+        self.logger.info(f"Log rotation: 10 MB per file, 5 backups")
         self.logger.info(f"Test mode: {self.test_mode}")
         self.logger.info(f"Output directory: {self.output_dir}")
         if self.target_video_size_mb > 0:
             self.logger.info(f"Full match video target size: {self.target_video_size_mb:.1f} MB")
         else:
             self.logger.info("Full match video compression: disabled")
+        if self.test_mode:
+            self.logger.info("Live audio capture: disabled in test mode")
+        elif not self.audio_enabled:
+            self.logger.info("Live audio capture: disabled by configuration")
+        elif not self.audio_device:
+            self.logger.info("Live audio capture: disabled; set --audio-device or CAPTURE_AUDIO_DEVICE to enable it")
+        else:
+            self.logger.info(
+                f"Live audio capture: enabled "
+                f"(backend={self.audio_backend}, device={self.audio_device}, "
+                f"{self.audio_sample_rate} Hz, {self.audio_channels} channel(s), AAC {self.audio_bitrate})"
+            )
+
+        for level, message, traceback_text in STARTUP_LOG_MESSAGES:
+            getattr(self.logger, level)(f"Startup warning: {message}")
+            if traceback_text:
+                self.logger.error(traceback_text.rstrip())
     
     def initialize_capture(self):
         """Initialize video capture with exponential backoff retry"""
@@ -267,7 +469,7 @@ class SmashBrosProcessor:
                             self.logger.info(f"Successfully opened capture device with backend: {backend}")
                             break
                     except Exception as e:
-                        self.logger.warning(f"Failed to open capture device with backend {backend}: {e}")
+                        self.logger.warning(f"Failed to open capture device with backend {backend}: {e}", exc_info=True)
                         continue
                 
                 if self.cap and self.cap.isOpened():
@@ -372,7 +574,7 @@ class SmashBrosProcessor:
             # print(f"Confidence: {confidence:.4f}")
             return confidence, confidence > self.ready_confidence_threshold
         except Exception as e:
-            self.logger.error(f"Error in detect_ready_to_fight: {e}")
+            self.logger.exception(f"Error in detect_ready_to_fight: {e}")
             return 0.0, False
     
     def detect_game_end(self, frame):
@@ -408,7 +610,7 @@ class SmashBrosProcessor:
             
             return confidence, confidence >= self.game_end_confidence_threshold
         except Exception as e:
-            self.logger.error(f"Error in detect_game_end: {e}")
+            self.logger.exception(f"Error in detect_game_end: {e}")
             return 0.0, False
     
     def is_black_screen(self, frame):
@@ -420,7 +622,7 @@ class SmashBrosProcessor:
             avg_brightness = np.mean(gray) / 255.0
             return avg_brightness, avg_brightness < self.black_screen_threshold
         except Exception as e:
-            self.logger.error(f"Error in is_black_screen: {e}")
+            self.logger.exception(f"Error in is_black_screen: {e}")
             return 0.0, False
     
     def format_timestamp(self, frame_number):
@@ -461,7 +663,7 @@ class SmashBrosProcessor:
         Test detection thresholds at a specific timestamp
         """
         if not self.test_mode or not self.test_video_path:
-            print("Error: test-threshold requires test mode with video")
+            self.logger.error("test-threshold requires test mode with video")
             return
         
         try:
@@ -478,7 +680,7 @@ class SmashBrosProcessor:
             # Read the frame
             ret, frame = self.cap.read()
             if not ret:
-                print(f"Error: Could not read frame at timestamp {timestamp_str}")
+                self.logger.error(f"Could not read frame at timestamp {timestamp_str}")
                 return
             
             # Get actual frame position (might be slightly different due to keyframes)
@@ -509,9 +711,9 @@ class SmashBrosProcessor:
             full_filename = f"full_frame_{timestamp_safe}_frame{actual_frame}.png"
             
             # Save the regions
-            cv2.imwrite(center_filename, center_region)
-            cv2.imwrite(game_filename, game_region)
-            cv2.imwrite(full_filename, frame)
+            write_image_or_log(self.logger, center_filename, center_region, "threshold center region")
+            write_image_or_log(self.logger, game_filename, game_region, "threshold game region")
+            write_image_or_log(self.logger, full_filename, frame, "threshold full frame")
             
             # Print analysis results
             print("\n" + "="*60)
@@ -560,15 +762,241 @@ class SmashBrosProcessor:
                        (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0) if is_black else (255, 255, 255), 2)
             
             debug_filename = f"debug_annotated_{timestamp_safe}_frame{actual_frame}.png"
-            cv2.imwrite(debug_filename, debug_frame)
+            write_image_or_log(self.logger, debug_filename, debug_frame, "threshold debug frame")
             print(f"Debug annotated frame saved: {debug_filename}")
             
         except ValueError as e:
-            print(f"Error: {e}")
+            self.logger.error(f"Threshold test input error: {e}")
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            self.logger.exception(f"Unexpected error while testing threshold: {e}")
         finally:
             self.cleanup()
+
+    def should_capture_audio(self):
+        return bool(
+            self.audio_enabled
+            and not self.test_mode
+            and self.audio_device
+        )
+
+    def build_audio_capture_command(self, audio_filepath):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            self.logger.warning("ffmpeg not found; audio capture disabled for this match.")
+            return None
+
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+        ]
+
+        if self.audio_backend == "dshow":
+            input_device = self.audio_device
+            if not input_device.lower().startswith("audio="):
+                input_device = f"audio={input_device}"
+            command.extend(["-f", "dshow", "-thread_queue_size", "1024", "-i", input_device])
+        elif self.audio_backend == "avfoundation":
+            input_device = self.audio_device
+            if not input_device.startswith(":"):
+                input_device = f":{input_device}"
+            command.extend(["-f", "avfoundation", "-thread_queue_size", "1024", "-i", input_device])
+        elif self.audio_backend == "pulse":
+            command.extend(["-f", "pulse", "-thread_queue_size", "1024", "-i", self.audio_device])
+        elif self.audio_backend == "alsa":
+            command.extend(["-f", "alsa", "-thread_queue_size", "1024", "-i", self.audio_device])
+        else:
+            self.logger.warning(f"Unsupported audio backend '{self.audio_backend}'; audio capture disabled for this match.")
+            return None
+
+        command.extend([
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(self.audio_sample_rate),
+            "-ac",
+            str(self.audio_channels),
+            audio_filepath,
+        ])
+        return command
+
+    def start_audio_capture(self, timestamp):
+        if not self.should_capture_audio():
+            self.audio_capture_process = None
+            self.current_audio_filepath = None
+            self.audio_capture_started_at = None
+            return None
+
+        audio_filepath = os.path.join(self.output_dir, f"{timestamp}.audio.wav")
+        command = self.build_audio_capture_command(audio_filepath)
+        if not command:
+            return None
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.audio_capture_process = process
+            self.current_audio_filepath = audio_filepath
+            self.audio_capture_started_at = time.monotonic()
+            self.logger.info(f"Started audio capture: {os.path.basename(audio_filepath)}")
+            return audio_filepath
+        except Exception as e:
+            self.logger.exception(f"Failed to start audio capture: {e}")
+            self.audio_capture_process = None
+            self.current_audio_filepath = None
+            self.audio_capture_started_at = None
+            return None
+
+    def stop_audio_capture(self):
+        process = self.audio_capture_process
+        audio_filepath = self.current_audio_filepath
+
+        self.audio_capture_process = None
+        self.current_audio_filepath = None
+        self.audio_capture_started_at = None
+
+        if not process:
+            return audio_filepath if audio_filepath and os.path.exists(audio_filepath) else None
+
+        stderr_output = ""
+        try:
+            if process.poll() is None:
+                _, stderr_output = process.communicate(
+                    input="q\n",
+                    timeout=self.audio_stop_timeout_secs,
+                )
+            else:
+                _, stderr_output = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Audio capture did not stop after quit request; terminating ffmpeg.")
+            process.terminate()
+            try:
+                _, stderr_output = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.logger.warning("Audio capture did not terminate; killing ffmpeg.")
+                process.kill()
+                _, stderr_output = process.communicate()
+        except Exception as e:
+            self.logger.exception(f"Error while stopping audio capture: {e}")
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
+        stderr_tail = tail_process_output(stderr_output)
+        if process.returncode not in (0, None):
+            self.logger.warning(
+                f"Audio capture exited with return code {process.returncode}."
+                + (f" ffmpeg output:\n{stderr_tail}" if stderr_tail else "")
+            )
+        elif stderr_tail:
+            self.logger.info(f"Audio capture ffmpeg output:\n{stderr_tail}")
+
+        if audio_filepath and os.path.exists(audio_filepath):
+            try:
+                audio_size = os.path.getsize(audio_filepath)
+            except OSError as e:
+                self.logger.warning(f"Failed to inspect audio file {audio_filepath}: {e}", exc_info=True)
+                return None
+
+            if audio_size > 44:
+                self.logger.info(
+                    f"Stopped audio capture: {os.path.basename(audio_filepath)} "
+                    f"({audio_size / (1024 * 1024):.2f} MB)"
+                )
+                return audio_filepath
+
+            self.logger.warning(f"Audio capture produced an empty file: {audio_filepath}")
+            try:
+                os.remove(audio_filepath)
+            except OSError as e:
+                self.logger.warning(f"Failed to remove empty audio file {audio_filepath}: {e}", exc_info=True)
+            return None
+
+        self.logger.warning("Audio capture did not produce an audio file.")
+        return None
+
+    def mux_audio_into_video(self, video_filepath, audio_filepath):
+        if not video_filepath or not audio_filepath:
+            return False
+        if not os.path.exists(video_filepath):
+            self.logger.warning(f"Skipping audio mux; video file does not exist: {video_filepath}")
+            return False
+        if not os.path.exists(audio_filepath):
+            self.logger.warning(f"Skipping audio mux; audio file does not exist: {audio_filepath}")
+            return False
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            self.logger.warning("ffmpeg not found; cannot mux audio into match video.")
+            return False
+
+        temp_filepath = video_filepath + ".with-audio.mp4"
+        ffmpeg_cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            video_filepath,
+            "-i",
+            audio_filepath,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            self.audio_bitrate,
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            temp_filepath,
+        ]
+
+        try:
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            if result.returncode != 0 or not os.path.exists(temp_filepath):
+                self.logger.warning(
+                    f"Failed to mux audio into {os.path.basename(video_filepath)} "
+                    f"(returncode={result.returncode}): {tail_process_output(result.stderr)}"
+                )
+                return False
+
+            os.replace(temp_filepath, video_filepath)
+            self.logger.info(f"Muxed audio into match video: {os.path.basename(video_filepath)}")
+            return True
+        except Exception as e:
+            self.logger.exception(f"Error while muxing audio into {video_filepath}: {e}")
+            return False
+        finally:
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError as e:
+                    self.logger.warning(f"Failed to remove temporary mux file {temp_filepath}: {e}", exc_info=True)
+
+    def cleanup_audio_file(self, audio_filepath):
+        if not audio_filepath or not os.path.exists(audio_filepath):
+            return
+
+        try:
+            os.remove(audio_filepath)
+            self.logger.info(f"Removed temporary audio file: {os.path.basename(audio_filepath)}")
+        except OSError as e:
+            self.logger.warning(f"Failed to remove temporary audio file {audio_filepath}: {e}", exc_info=True)
     
     def start_match_recording(self):
         """
@@ -607,8 +1035,10 @@ class SmashBrosProcessor:
         self.recording_start_time = time.monotonic()
         self.recording_written_frames = 0
         self.current_recording_effective_fps = None
-        
-        self.logger.info(f"Started recording: {filename}")
+        self.start_audio_capture(timestamp)
+
+        audio_status = " with audio" if self.current_audio_filepath else ""
+        self.logger.info(f"Started recording: {filename}{audio_status}")
         
         # Write buffered frames (pre-game footage)
         # for buffered_frame in self.frame_buffer:
@@ -644,6 +1074,7 @@ class SmashBrosProcessor:
         effective_fps: Optional[float],
         writer_fps: float,
         recording_written_frames: int,
+        audio_filepath: Optional[str] = None,
     ):
         """
         Run all slow post-recording work off the capture loop.
@@ -651,6 +1082,7 @@ class SmashBrosProcessor:
         post_processing_lock = getattr(self, "post_processing_lock", None)
         lock_acquired = False
         extraction_fps = writer_fps
+        audio_muxed = False
 
         try:
             if post_processing_lock:
@@ -673,6 +1105,8 @@ class SmashBrosProcessor:
                     extraction_fps = effective_fps
 
             if match_filepath:
+                if audio_filepath:
+                    audio_muxed = self.mux_audio_into_video(match_filepath, audio_filepath)
                 self.compress_video_to_target_size(match_filepath)
 
             self.extract_result_screens(
@@ -686,12 +1120,14 @@ class SmashBrosProcessor:
 
             self.cleanup_old_matches()
         except Exception as e:
-            self.logger.error(f"Error during match post-processing: {e}")
+            self.logger.exception(f"Error during match post-processing: {e}")
         finally:
             recording_frames.clear()
             recording_game_end_scores.clear()
             import gc
             gc.collect()
+            if audio_muxed:
+                self.cleanup_audio_file(audio_filepath)
             if lock_acquired:
                 post_processing_lock.release()
 
@@ -742,7 +1178,7 @@ class SmashBrosProcessor:
             )
             return True
         except Exception as e:
-            self.logger.warning(f"Failed to correct recorded video FPS for {filepath}: {e}")
+            self.logger.exception(f"Failed to correct recorded video FPS for {filepath}: {e}")
             return False
         finally:
             if cap is not None:
@@ -752,12 +1188,13 @@ class SmashBrosProcessor:
             if os.path.exists(temp_filepath):
                 try:
                     os.remove(temp_filepath)
-                except OSError:
-                    pass
+                except OSError as e:
+                    self.logger.warning(f"Failed to remove temporary FPS correction file {temp_filepath}: {e}", exc_info=True)
 
     def get_video_duration_seconds(self, filepath: str) -> Optional[float]:
         cap = cv2.VideoCapture(filepath)
         if not cap.isOpened():
+            self.logger.warning(f"Could not open video to determine duration: {filepath}")
             return None
 
         try:
@@ -767,7 +1204,10 @@ class SmashBrosProcessor:
                 return frame_count / fps
             return None
         finally:
-            cap.release()
+            try:
+                cap.release()
+            except Exception as e:
+                self.logger.warning(f"Failed to release duration probe for {filepath}: {e}", exc_info=True)
 
     def compress_video_to_target_size(self, filepath: str) -> bool:
         if self.target_video_size_mb <= 0 or not os.path.exists(filepath):
@@ -822,7 +1262,10 @@ class SmashBrosProcessor:
                         "-y",
                         "-i",
                         filepath,
-                        "-an",
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a?",
                         *encoder_args,
                         "-b:v",
                         f"{current_bitrate_kbps}k",
@@ -832,6 +1275,10 @@ class SmashBrosProcessor:
                         f"{current_bitrate_kbps * 2}k",
                         "-pix_fmt",
                         "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        self.audio_bitrate,
                         "-movflags",
                         "+faststart",
                         temp_filepath,
@@ -841,7 +1288,8 @@ class SmashBrosProcessor:
                     if result.returncode != 0 or not os.path.exists(temp_filepath):
                         encoder_name = encoder_args[1] if len(encoder_args) > 1 else "unknown"
                         self.logger.warning(
-                            f"ffmpeg compression failed with {encoder_name}: {result.stderr.strip()}"
+                            f"ffmpeg compression failed with {encoder_name} "
+                            f"(returncode={result.returncode}): {result.stderr.strip()}"
                         )
                         break
 
@@ -886,13 +1334,16 @@ class SmashBrosProcessor:
 
             self.logger.warning("Compression did not produce a smaller file; keeping original.")
             return False
+        except Exception as e:
+            self.logger.exception(f"Error while compressing full match video {filepath}: {e}")
+            return False
         finally:
             for cleanup_path in (temp_filepath, best_temp_path):
                 if cleanup_path and os.path.exists(cleanup_path):
                     try:
                         os.remove(cleanup_path)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        self.logger.warning(f"Failed to remove temporary compression file {cleanup_path}: {e}", exc_info=True)
     
     def clear_frame_buffers(self):
         """
@@ -928,6 +1379,7 @@ class SmashBrosProcessor:
             recording_frames = self.recording_frames
             recording_game_end_scores = self.recording_game_end_scores
             frame_30_image = self.frame_30_image.copy() if self.frame_30_image is not None else None
+            audio_filepath = self.stop_audio_capture()
 
             # Hand ownership of the just-finished match buffers to the worker
             # and leave the capture loop ready to detect the next match.
@@ -952,6 +1404,7 @@ class SmashBrosProcessor:
                 effective_fps,
                 writer_fps,
                 recording_written_frames,
+                audio_filepath,
             )
 
             if self.test_mode:
@@ -961,6 +1414,7 @@ class SmashBrosProcessor:
                     target=self.post_process_match_recording,
                     args=post_process_args,
                     daemon=True,
+                    name="match-post-processing",
                 )
                 post_process_thread.start()
                 self.logger.info("Match post-processing started in background thread")
@@ -990,7 +1444,7 @@ class SmashBrosProcessor:
                 if absolute_path in excluded_paths:
                     continue
 
-                if not os.path.isfile(filepath) or not filename.endswith('.mp4'):
+                if not os.path.isfile(filepath) or not filename.endswith(('.mp4', '.audio.wav')):
                     continue
 
                 try:
@@ -1001,7 +1455,7 @@ class SmashBrosProcessor:
                         "size": os.path.getsize(filepath),
                     }
                 except OSError as e:
-                    self.logger.warning(f"Failed to inspect cleanup candidate {filename}: {e}")
+                    self.logger.warning(f"Failed to inspect cleanup candidate {filename}: {e}", exc_info=True)
 
     def ensure_free_disk_space(self, reason="disk space check", excluded_paths=None):
         """
@@ -1043,7 +1497,7 @@ class SmashBrosProcessor:
                         f"Deleted oldest match file under disk pressure: {candidate['name']} (age: {age_days:.1f} days)"
                     )
                 except OSError as e:
-                    self.logger.warning(f"Failed to delete file {candidate['name']} during disk-pressure cleanup: {e}")
+                    self.logger.warning(f"Failed to delete file {candidate['name']} during disk-pressure cleanup: {e}", exc_info=True)
 
             final_free_bytes = self.get_disk_free_bytes()
             final_free_gb = final_free_bytes / (1024 * 1024 * 1024)
@@ -1060,7 +1514,7 @@ class SmashBrosProcessor:
                 )
             return True
         except Exception as e:
-            self.logger.error(f"Error during disk-pressure cleanup: {e}")
+            self.logger.exception(f"Error during disk-pressure cleanup: {e}")
             return False
     
     def cleanup_old_matches(self):
@@ -1086,8 +1540,8 @@ class SmashBrosProcessor:
             if os.path.exists(self.output_dir):
                 for filename in os.listdir(self.output_dir):
                     filepath = os.path.join(self.output_dir, filename)
-                    # Skip directories and non-mp4 files
-                    if not os.path.isfile(filepath) or not filename.endswith('.mp4'):
+                    # Skip directories and unrelated files
+                    if not os.path.isfile(filepath) or not filename.endswith(('.mp4', '.audio.wav')):
                         continue
                     try:
                         file_mtime = os.path.getmtime(filepath)
@@ -1098,7 +1552,7 @@ class SmashBrosProcessor:
                             deleted_size += file_size
                             self.logger.info(f"Deleted old match file: {filename} (age: {(datetime.datetime.now().timestamp() - file_mtime) / 86400:.1f} days)")
                     except OSError as e:
-                        self.logger.warning(f"Failed to delete file {filename}: {e}")
+                        self.logger.warning(f"Failed to delete old match file {filename}: {e}", exc_info=True)
             
             # Clean up result screen artifacts
             if os.path.exists(self.result_screens_dir):
@@ -1116,7 +1570,7 @@ class SmashBrosProcessor:
                             deleted_size += file_size
                             self.logger.info(f"Deleted old result screen artifact: {filename} (age: {(datetime.datetime.now().timestamp() - file_mtime) / 86400:.1f} days)")
                     except OSError as e:
-                        self.logger.warning(f"Failed to delete file {filename}: {e}")
+                        self.logger.warning(f"Failed to delete old result screen artifact {filename}: {e}", exc_info=True)
 
             if deleted_count > 0:
                 size_mb = deleted_size / (1024 * 1024)
@@ -1125,7 +1579,7 @@ class SmashBrosProcessor:
                 self.logger.debug(f"Cleanup complete: No files older than {self.rolling_window_days} days found")
                 
         except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
+            self.logger.exception(f"Error during cleanup: {e}")
 
     def save_result_screen_debug_artifacts(
         self,
@@ -1178,7 +1632,7 @@ class SmashBrosProcessor:
                 frame_30_image = self.frame_30_image
             if frame_30_image is not None:
                 frame_42_path = os.path.join(self.result_screens_dir, f"{base_name}_frame_42.png")
-                cv2.imwrite(frame_42_path, frame_30_image)
+                write_image_or_log(self.logger, frame_42_path, frame_30_image, "result screen diagnostic frame 42")
 
             manifest_path = os.path.join(self.result_screens_dir, f"{base_name}_debug.json")
             manifest = {
@@ -1208,7 +1662,7 @@ class SmashBrosProcessor:
             )
             return manifest_path
         except Exception as e:
-            self.logger.error(f"Failed to save result screen diagnostic: {e}")
+            self.logger.exception(f"Failed to save result screen diagnostic: {e}")
             return None
 
     def get_result_screen_output_fps(self, source_fps=None):
@@ -1335,8 +1789,8 @@ class SmashBrosProcessor:
             # Use the same base name as the result screen video
             result_base_name = os.path.splitext(result_filename)[0]  # Remove .mp4 extension
             frame_30_image_path = os.path.join(self.result_screens_dir, f"{result_base_name}_frame_42.png")
-            cv2.imwrite(frame_30_image_path, frame_30_image)
-            self.logger.info(f"Saved frame 42 image: {os.path.basename(frame_30_image_path)}")
+            if write_image_or_log(self.logger, frame_30_image_path, frame_30_image, "result screen frame 42"):
+                self.logger.info(f"Saved frame 42 image: {os.path.basename(frame_30_image_path)}")
         
         # Calculate duration
         duration_seconds = len(result_frames) / result_fps if result_fps > 0 else 0
@@ -1357,9 +1811,10 @@ class SmashBrosProcessor:
                     target=self.process_match_results,
                     args=(result_filepath, frame_30_image_path, result_fps, match_filepath),
                     daemon=True,
+                    name="match-result-processing",
                 )
                 background_thread.start()
-                print("Match results processing started in background thread")
+                self.logger.info("Match results processing started in background thread")
             else:
                 self.process_match_results(result_filepath, frame_30_image_path, result_fps, match_filepath)
 
@@ -1373,7 +1828,7 @@ class SmashBrosProcessor:
         match_filepath: Optional[str],
     ):
         try:
-            print("\nProcessing match results in background...")
+            log_section(self.logger, "MATCH RESULT PROCESSING START")
 
             match_stats = self.get_match_stats(
                 result_filepath,
@@ -1394,9 +1849,9 @@ class SmashBrosProcessor:
                     frame_30_image_path=frame_30_image_path,
                 )
             else:
-                print("Failed to extract match stats, skipping database save")
+                self.logger.error("Failed to extract match stats, skipping database save")
         except Exception as e:
-            print(f"Error in background match processing: {e}")
+            self.logger.exception(f"Error in background match processing: {e}")
     
     def process_frame(self, frame):
         """
@@ -1547,6 +2002,7 @@ class SmashBrosProcessor:
         """
         Main processing loop
         """
+        log_section(self.logger, "CAPTURE LOOP START")
         self.logger.info("Starting Smash Bros match processor...")
         self.logger.info(f"State: {self.state.value}")
         
@@ -1572,7 +2028,13 @@ class SmashBrosProcessor:
                         continue
                 
                 # Process the frame
-                self.process_frame(frame)
+                try:
+                    self.process_frame(frame)
+                except Exception as e:
+                    self.logger.exception(
+                        f"Unhandled error while processing frame {self.current_frame_number}: {e}"
+                    )
+                    raise
                 frame_count += 1
                 
                 # Periodic memory cleanup
@@ -1750,7 +2212,7 @@ class SmashBrosProcessor:
             }, key=str.lower)
             return ", ".join(names) if names else fallback
         except Exception as e:
-            print(f"Warning: Failed to fetch player names: {e}")
+            self.logger.exception(f"Failed to fetch player names for Gemini prompt: {e}")
             return fallback
 
 
@@ -1767,7 +2229,7 @@ class SmashBrosProcessor:
         Includes frame 42 (~1.4 seconds into match) image to help identify players
         """
         if not gemini_client:
-            print("Warning: Gemini client not available, skipping stats extraction")
+            self.logger.warning("Gemini client not available, skipping stats extraction")
             return None
         
         # Use instance slowdown factor if not provided
@@ -1793,12 +2255,13 @@ class SmashBrosProcessor:
                 player_name_examples=self.get_player_name_examples(),
             )
         except Exception as e:
-            print(f"Error extracting match stats: {e}")
+            self.logger.exception(f"Error extracting match stats: {e}")
             return None
     
     def get_player(self, player_name: str) -> Optional[dict]:
         """Get or create a player in the database"""
         if not self.supabase_client:
+            self.logger.warning(f"Supabase client unavailable while getting/creating player {player_name}")
             return None
         
         try:
@@ -1809,12 +2272,13 @@ class SmashBrosProcessor:
             )
             return response.data[0]
         except Exception as e:
-            print(f"Error getting/creating player {player_name}: {e}")
+            self.logger.exception(f"Error getting/creating player {player_name}: {e}")
             return None
         
     def update_player_elo(self, player_id: str, elo: int):
         """Update a player's ELO in the database"""
         if not self.supabase_client:
+            self.logger.warning(f"Supabase client unavailable while updating player ELO for {player_id}")
             return
         
         self.supabase_client.table("players").update({"elo": elo}).eq("id", player_id).execute()
@@ -1822,6 +2286,7 @@ class SmashBrosProcessor:
     def create_match(self) -> Optional[int]:
         """Create a new match in the database"""
         if not self.supabase_client:
+            self.logger.warning("Supabase client unavailable while creating match")
             return None
         
         try:
@@ -1832,7 +2297,7 @@ class SmashBrosProcessor:
             )
             return response.data[0]['id']
         except Exception as e:
-            print(f"Error creating match: {e}")
+            self.logger.exception(f"Error creating match: {e}")
             return None
         
     def save_match_stats(
@@ -1844,25 +2309,25 @@ class SmashBrosProcessor:
         frame_30_image_path: Optional[str] = None,
     ):
         """Save match stats to the database"""
-        print(stats)
+        self.logger.info(f"Parsed match stats: {stats}")
         if not self.supabase_client:
-            print("Warning: Supabase client not available, skipping database save")
+            self.logger.warning("Supabase client not available, skipping database save")
             return
         
         # Check if match should be skipped (eligibility checks)
         match_is_no_contest = all(not stat.has_won for stat in stats)
         if match_is_no_contest:
-            print("Match is a no contest, skipping database save")
+            self.logger.info("Match is a no contest, skipping database save")
             return
         
         match_has_cpu = any(stat.is_cpu for stat in stats)
         if match_has_cpu:
-            print("Match has CPU, skipping database save")
+            self.logger.info("Match has CPU, skipping database save")
             return
         
         # Skip online matches
         if stats and stats[0].is_online_match:
-            print("Match is online, skipping database save")
+            self.logger.info("Match is online, skipping database save")
             return
         
         match_has_unknown_players = False
@@ -1873,7 +2338,7 @@ class SmashBrosProcessor:
                 break
         
         if match_has_unknown_players:
-            print("Match has unknown players (Player 1,2,3,etc.), skipping database save")
+            self.logger.info("Match has unknown players (Player 1,2,3,etc.), skipping database save")
             return
 
         # Match passed all eligibility checks - NOW create the match record
@@ -1902,6 +2367,7 @@ class SmashBrosProcessor:
             for stat in stats:
                 player = self.get_player(stat.player_name)
                 if player is None:
+                    self.logger.error(f"Skipping participant because player lookup failed: {stat.player_name}")
                     continue
                 
                 # Save match participant
@@ -1941,9 +2407,7 @@ class SmashBrosProcessor:
                     winners.append(player['display_name'])
             
             # Print match results
-            print("\n" + "="*60)
-            print("MATCH RESULTS")
-            print("="*60)
+            log_section(self.logger, "MATCH RESULTS")
             
             if winners:
                 print(f"🏆 Winner(s): {', '.join(winners)}")
@@ -2116,7 +2580,7 @@ class SmashBrosProcessor:
             #         print("YouTube upload failed. Video saved locally.")
             
         except Exception as e:
-            print(f"Error saving match stats: {e}")
+            self.logger.exception(f"Error saving match stats: {e}")
     
     def rename_match_files(
         self,
@@ -2194,7 +2658,7 @@ class SmashBrosProcessor:
                             self.logger.info(f"Renamed frame 42 image: {os.path.basename(frame_30_old_path)} -> {os.path.basename(frame_30_new_path)}")
                         
         except Exception as e:
-            self.logger.error(f"Error renaming match files: {e}")
+            self.logger.exception(f"Error renaming match files: {e}")
 
         return match_filepath, result_screen_filepath, frame_30_image_path
     
@@ -2222,47 +2686,85 @@ class SmashBrosProcessor:
                 os.replace(temp_filepath, filepath)
                 self.logger.info(f"Added metadata to {filepath}: {participants_str}")
             else:
-                self.logger.warning(f"Failed to add metadata to {filepath}: {result.stderr}")
+                self.logger.warning(
+                    f"Failed to add metadata to {filepath} "
+                    f"(returncode={result.returncode}): {result.stderr}"
+                )
                 if os.path.exists(temp_filepath):
                     os.remove(temp_filepath)
         except Exception as e:
-            self.logger.warning(f"Error adding metadata to {filepath}: {e}")
+            self.logger.exception(f"Error adding metadata to {filepath}: {e}")
             if os.path.exists(temp_filepath):
-                os.remove(temp_filepath)
+                try:
+                    os.remove(temp_filepath)
+                except OSError as cleanup_error:
+                    self.logger.warning(f"Failed to remove temporary metadata file {temp_filepath}: {cleanup_error}", exc_info=True)
 
     def cleanup(self):
         """
         Clean up resources
         """
-        # Handle any ongoing black period at the end
-        if self.in_black_period:
-            black_period_end_frame = self.current_frame_number
-            black_period_end_timestamp = self.format_timestamp(black_period_end_frame)
+        logger = getattr(self, "logger", logging.getLogger(__name__))
+        log_section(logger, "CAPTURE CLEANUP START")
+        try:
+            # Handle any ongoing black period at the end
+            if self.in_black_period:
+                black_period_end_frame = self.current_frame_number
+                black_period_end_timestamp = self.format_timestamp(black_period_end_frame)
+
+                duration_frames = black_period_end_frame - self.black_period_start_frame + 1
+                duration_seconds = duration_frames / self.fps if self.fps > 0 else 0
+
+                black_period = {
+                    'start_frame': self.black_period_start_frame,
+                    'end_frame': black_period_end_frame,
+                    'start_timestamp': self.black_period_start_timestamp,
+                    'end_timestamp': black_period_end_timestamp,
+                    'duration_frames': duration_frames,
+                    'duration_seconds': duration_seconds
+                }
+                self.black_periods.append(black_period)
+
+                if self.test_mode:
+                    print(f"[BLACK PERIOD END] Frame {black_period_end_frame} ({black_period_end_timestamp}) - Duration: {duration_seconds:.2f}s ({duration_frames} frames) [END OF VIDEO]")
+
+            # Print summary of all black periods
+            try:
+                self.print_black_periods_summary()
+            except Exception as e:
+                logger.exception(f"Failed to print black periods summary: {e}")
             
-            duration_frames = black_period_end_frame - self.black_period_start_frame + 1
-            duration_seconds = duration_frames / self.fps if self.fps > 0 else 0
-            
-            black_period = {
-                'start_frame': self.black_period_start_frame,
-                'end_frame': black_period_end_frame,
-                'start_timestamp': self.black_period_start_timestamp,
-                'end_timestamp': black_period_end_timestamp,
-                'duration_frames': duration_frames,
-                'duration_seconds': duration_seconds
-            }
-            self.black_periods.append(black_period)
-            
-            if self.test_mode:
-                print(f"[BLACK PERIOD END] Frame {black_period_end_frame} ({black_period_end_timestamp}) - Duration: {duration_seconds:.2f}s ({duration_frames} frames) [END OF VIDEO]")
-        
-        # Print summary of all black periods
-        self.print_black_periods_summary()
-        
-        if self.out:
-            self.out.release()
-        if self.cap:
-            self.cap.release()
-        cv2.destroyAllWindows()
+            if self.out:
+                try:
+                    self.out.release()
+                except Exception as e:
+                    logger.exception(f"Failed to release video writer during cleanup: {e}")
+                finally:
+                    self.out = None
+            if self.audio_capture_process:
+                try:
+                    audio_filepath = self.stop_audio_capture()
+                    if audio_filepath:
+                        logger.warning(
+                            f"Audio capture stopped during cleanup and was not muxed: {audio_filepath}"
+                        )
+                except Exception as e:
+                    logger.exception(f"Failed to stop audio capture during cleanup: {e}")
+            if self.cap:
+                try:
+                    self.cap.release()
+                except Exception as e:
+                    logger.exception(f"Failed to release capture device during cleanup: {e}")
+                finally:
+                    self.cap = None
+            try:
+                cv2.destroyAllWindows()
+            except Exception as e:
+                logger.exception(f"Failed to destroy OpenCV windows during cleanup: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error during cleanup: {e}")
+        finally:
+            logger.info("Capture cleanup complete")
 
 
 def main():
@@ -2291,74 +2793,103 @@ def main():
     # Video processing arguments
     parser.add_argument('--video-slowdown-factor', type=int, default=10, help='Factor to slow down result screen videos for better API processing (default: 10)')
     parser.add_argument('--target-video-size-mb', type=float, default=100.0, help='Target size for saved full match videos after recording (default: 100). Set to 0 to disable compression.')
+
+    # Audio capture arguments
+    parser.add_argument('--no-audio', action='store_true', help='Disable live audio capture even if an audio device is configured.')
+    parser.add_argument('--audio-device', type=str, default=None, help='ffmpeg audio input device name. Defaults to CAPTURE_AUDIO_DEVICE. On Windows, use ffmpeg -list_devices true -f dshow -i dummy to find it.')
+    parser.add_argument('--audio-backend', type=str, default=None, choices=['dshow', 'avfoundation', 'pulse', 'alsa'], help='ffmpeg audio input backend. Defaults to CAPTURE_AUDIO_BACKEND or the platform default.')
+    parser.add_argument('--audio-sample-rate', type=int, default=None, help='Audio sample rate for temporary WAV capture. Defaults to CAPTURE_AUDIO_SAMPLE_RATE or 48000.')
+    parser.add_argument('--audio-channels', type=int, default=None, help='Number of audio channels to save. Defaults to CAPTURE_AUDIO_CHANNELS or 2.')
+    parser.add_argument('--audio-bitrate', type=str, default=None, help='AAC bitrate when muxing audio into MP4. Defaults to CAPTURE_AUDIO_BITRATE or 160k.')
     
     # Rolling window arguments
     parser.add_argument('--rolling-window-days', type=int, default=30, help='Number of days to keep match files. Files older than this will be automatically deleted (default: 30). Set to 0 to disable cleanup.')
     parser.add_argument('--min-free-space-gb', type=float, default=5.0, help='Minimum free disk space before starting new video writes. Deletes oldest match files when below this value (default: 5.0). Set to 0 to disable disk-pressure cleanup.')
     
     args = parser.parse_args()
+    configure_capture_logging(args.output)
+    cli_logger = logging.getLogger(__name__)
+    log_section(cli_logger, "SMASH CAPTURE CLI START")
+    cli_logger.info("Command-line arguments parsed")
     
     if args.test and not args.video:
-        print("Error: Test mode requires --video parameter")
-        return
+        cli_logger.error("Test mode requires --video parameter")
+        return 2
     
     if args.test_threshold and not args.video:
-        print("Error: --test-threshold requires --video parameter")
-        return
+        cli_logger.error("--test-threshold requires --video parameter")
+        return 2
     
     # Validate region boundaries
     def validate_region(name, top, bottom, left, right):
         if not (0.0 <= top < bottom <= 1.0):
-            print(f"Error: {name} top ({top}) must be < bottom ({bottom}) and both in range 0.0-1.0")
+            cli_logger.error(f"{name} top ({top}) must be < bottom ({bottom}) and both in range 0.0-1.0")
             return False
         if not (0.0 <= left < right <= 1.0):
-            print(f"Error: {name} left ({left}) must be < right ({right}) and both in range 0.0-1.0")
+            cli_logger.error(f"{name} left ({left}) must be < right ({right}) and both in range 0.0-1.0")
             return False
         return True
     
     if not validate_region("Center region", args.center_region_top, args.center_region_bottom, 
                           args.center_region_left, args.center_region_right):
-        return
+        return 2
     
     if not validate_region("Game region", args.game_region_top, args.game_region_bottom,
                           args.game_region_left, args.game_region_right):
-        return
-    
-    # Create processor
-    processor = SmashBrosProcessor(
-        device_index=args.device,
-        output_dir=args.output,
-        test_mode=args.test or bool(args.test_threshold),
-        test_video_path=args.video,
-        center_region_top=args.center_region_top,
-        center_region_bottom=args.center_region_bottom,
-        center_region_left=args.center_region_left,
-        center_region_right=args.center_region_right,
-        game_region_top=args.game_region_top,
-        game_region_bottom=args.game_region_bottom,
-        game_region_left=args.game_region_left,
-        game_region_right=args.game_region_right,
-        consecutive_black_threshold_secs=args.black_frame_threshold_secs,
-        play_video=args.play_video,
-        video_slowdown_factor=args.video_slowdown_factor,
-        rolling_window_days=args.rolling_window_days,
-        min_free_space_gb=args.min_free_space_gb,
-        target_video_size_mb=args.target_video_size_mb
-    )
-    
-    # Handle test-threshold mode
-    if args.test_threshold:
-        processor.test_threshold_at_timestamp(args.test_threshold)
-        return
-    
-    # Run processor
+        return 2
+
+    if args.audio_sample_rate is not None and args.audio_sample_rate <= 0:
+        cli_logger.error("--audio-sample-rate must be greater than 0")
+        return 2
+
+    if args.audio_channels is not None and args.audio_channels <= 0:
+        cli_logger.error("--audio-channels must be greater than 0")
+        return 2
+
     try:
+        # Create processor
+        processor = SmashBrosProcessor(
+            device_index=args.device,
+            output_dir=args.output,
+            test_mode=args.test or bool(args.test_threshold),
+            test_video_path=args.video,
+            center_region_top=args.center_region_top,
+            center_region_bottom=args.center_region_bottom,
+            center_region_left=args.center_region_left,
+            center_region_right=args.center_region_right,
+            game_region_top=args.game_region_top,
+            game_region_bottom=args.game_region_bottom,
+            game_region_left=args.game_region_left,
+            game_region_right=args.game_region_right,
+            consecutive_black_threshold_secs=args.black_frame_threshold_secs,
+            play_video=args.play_video,
+            video_slowdown_factor=args.video_slowdown_factor,
+            rolling_window_days=args.rolling_window_days,
+            min_free_space_gb=args.min_free_space_gb,
+            target_video_size_mb=args.target_video_size_mb,
+            audio_enabled=not args.no_audio,
+            audio_device=args.audio_device,
+            audio_backend=args.audio_backend,
+            audio_sample_rate=args.audio_sample_rate,
+            audio_channels=args.audio_channels,
+            audio_bitrate=args.audio_bitrate,
+        )
+
+        # Handle test-threshold mode
+        if args.test_threshold:
+            processor.test_threshold_at_timestamp(args.test_threshold)
+            return 0
+
+        # Run processor
         processor.run()
+        return 0
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        cli_logger.info("Interrupted by user")
+        return 130
     except Exception as e:
-        print(f"Error: {e}")
+        cli_logger.exception(f"Fatal error in capture process: {e}")
+        return 1
 
 
 if __name__ == "__main__":
-    main() 
+    sys.exit(main())
