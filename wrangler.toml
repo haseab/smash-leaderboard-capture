@@ -1,0 +1,10 @@
+name = "smash-gemini-proxy"
+main = "cloudflare/gemini-proxy-worker.js"
+compatibility_date = "2026-06-11"
+
+[vars]
+GEMINI_MODEL = "gemini-3.1-pro-preview"
+GEMINI_FALLBACK_MODELS = "gemini-3-pro-preview,gemini-3.1-flash-lite,gemini-3-flash-preview"
+GEMINI_API_VERSION = "v1beta"
+RATE_LIMIT_PER_MINUTE = "10"
+MAX_UPLOAD_BYTES = "83886080"
