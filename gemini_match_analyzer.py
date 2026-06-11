@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import os
 import subprocess
 import tempfile
@@ -6,6 +7,7 @@ import time
 from typing import List, Optional
 
 import cv2
+import requests
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -25,6 +27,7 @@ DEFAULT_GEMINI_MAX_RETRIES = 5
 DEFAULT_GEMINI_RETRY_DELAY_SECONDS = 300
 DEFAULT_MAX_RESULT_SCREEN_SECONDS = 10.0
 DEFAULT_GEMINI_API_VERSION = "v1beta"
+DEFAULT_GEMINI_PROXY_TIMEOUT_SECONDS = 900
 
 
 class GeminiPlayerStats(BaseModel):
@@ -73,10 +76,81 @@ class PlayerStats(GeminiPlayerStats):
     )
 
 
+class GeminiProxyClient:
+    def __init__(self, proxy_url: str, auth_token: str, timeout_seconds: int):
+        self.proxy_url = proxy_url.rstrip("/")
+        self.auth_token = auth_token
+        self.timeout_seconds = timeout_seconds
+
+    def analyze_match(
+        self,
+        *,
+        result_video_path: str,
+        context_image_path: Optional[str],
+        result_still_paths: List[str],
+        player_name_examples: Optional[str],
+        video_sample_fps: float,
+    ) -> GeminiMatchStats:
+        opened_files = []
+        files = []
+
+        def add_file(field_name: str, path: str, fallback_mime_type: str):
+            mime_type = mimetypes.guess_type(path)[0] or fallback_mime_type
+            file_handle = open(path, "rb")
+            opened_files.append(file_handle)
+            files.append((field_name, (os.path.basename(path), file_handle, mime_type)))
+
+        try:
+            if context_image_path and os.path.exists(context_image_path):
+                add_file("context_image", context_image_path, "image/png")
+
+            for still_path in result_still_paths:
+                add_file("result_still", still_path, "image/png")
+
+            add_file("result_video", result_video_path, "video/mp4")
+
+            metadata = {
+                "player_name_examples": player_name_examples,
+                "video_sample_fps": video_sample_fps,
+            }
+            response = requests.post(
+                self.proxy_url,
+                headers={"Authorization": f"Bearer {self.auth_token}"},
+                data={"metadata": json.dumps(metadata)},
+                files=files,
+                timeout=self.timeout_seconds,
+            )
+
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Gemini proxy returned HTTP {response.status_code}: {response.text[:1000]}"
+                )
+
+            payload = response.json()
+            if "match_stats" in payload:
+                payload = payload["match_stats"]
+            return GeminiMatchStats.model_validate(payload)
+        finally:
+            for file_handle in opened_files:
+                file_handle.close()
+
+
 def create_gemini_client():
+    proxy_url = os.getenv("GEMINI_PROXY_URL", "").strip()
+    if proxy_url:
+        proxy_token = os.getenv("GEMINI_PROXY_TOKEN", "").strip()
+        if not proxy_token:
+            raise ValueError("GEMINI_PROXY_TOKEN not found in environment variables")
+
+        return GeminiProxyClient(
+            proxy_url=proxy_url,
+            auth_token=proxy_token,
+            timeout_seconds=_env_int("GEMINI_PROXY_TIMEOUT_SECONDS", DEFAULT_GEMINI_PROXY_TIMEOUT_SECONDS),
+        )
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY not found in environment variables")
+        raise ValueError("GEMINI_PROXY_URL or GEMINI_API_KEY not found in environment variables")
 
     return genai.Client(
         api_key=api_key,
@@ -626,6 +700,19 @@ def analyze_match_results_video(
             max_stills=result_still_count,
         )
         _log(logger, "info", f"Extracted {len(result_still_paths)} high-resolution result still(s).")
+
+        if isinstance(client, GeminiProxyClient):
+            _log(logger, "info", f"Sending result screen assets to Gemini proxy: {client.proxy_url}")
+            match_stats = client.analyze_match(
+                result_video_path=slowed_video_path,
+                context_image_path=context_image_path,
+                result_still_paths=result_still_paths,
+                player_name_examples=player_name_examples,
+                video_sample_fps=video_sample_fps,
+            )
+            player_stats = _to_downstream_player_stats(match_stats)
+            _log(logger, "info", f"Successfully extracted stats for {len(player_stats)} player(s).")
+            return player_stats
 
         try:
             parts = []

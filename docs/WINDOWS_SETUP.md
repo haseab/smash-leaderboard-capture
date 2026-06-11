@@ -93,8 +93,11 @@ smash-leaderboard-ai/
    ```
    SUPABASE_URL=your_url
    SUPABASE_SERVICE_ROLE_KEY=your_key
-   GEMINI_API_KEY=your_key
+   GEMINI_PROXY_URL=https://your-worker.your-subdomain.workers.dev/analyze
+   GEMINI_PROXY_TOKEN=your_client_token
    ```
+
+   Do not transfer `GEMINI_API_KEY` to a shared capture computer. Store the real Gemini key as a Cloudflare Worker secret; see `GEMINI_PROXY.md`.
 
 2. **`client_secrets.json`** - YouTube OAuth client credentials
 

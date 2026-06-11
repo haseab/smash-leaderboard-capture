@@ -3,11 +3,22 @@
 ## Tools
 - Nintendo Switch
 - EVGA Capture Card
-- Google Gemini API (default model: Gemini 3.1 Pro Preview)
+- Cloudflare Worker Gemini proxy (default model: Gemini 3.1 Pro Preview)
 
 ## How it works
 Matches are automatically detected & recorded by a computer program connected to the capture card that is continuously monitoring the nintendo switch. 
 Once a match is finished, a clip plus high-resolution stills from the results screen are sent to Gemini to extract stats from, after which the leaderboard is updated based on the match's stats.
+
+## Gemini proxy
+
+Do not put `GEMINI_API_KEY` on a shared capture computer. Deploy `cloudflare/gemini-proxy-worker.js` as a Cloudflare Worker, set `GEMINI_API_KEY` and `CLIENT_AUTH_TOKEN` as Worker secrets, then configure only these values on the capture machine:
+
+```bash
+GEMINI_PROXY_URL=https://your-worker.your-subdomain.workers.dev/analyze
+GEMINI_PROXY_TOKEN=replace-with-the-client-token
+```
+
+When `GEMINI_PROXY_URL` is present, the capture scripts send the result video/stills to the Worker and never initialize a local Gemini API client. See `docs/GEMINI_PROXY.md` for setup details.
 
 ## Audio capture
 
