@@ -81,17 +81,18 @@ export default {
     try {
       return await handleRequest(request, env, ctx);
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : 500;
-      const message = error instanceof HttpError ? error.message : "Internal proxy error";
+      const status = errorStatus(error);
       const headers = error instanceof HttpError ? error.headers : {};
+      const payload = errorPayload(error);
       if (!(error instanceof HttpError) || status >= 500) {
         console.error("Gemini proxy error", {
           message: error?.message,
           status,
+          payload: error instanceof GeminiApiError ? error.payload : undefined,
           stack: error?.stack,
         });
       }
-      return jsonResponse({ error: message }, status, headers);
+      return jsonResponse(payload, status, headers);
     }
   },
 };
@@ -138,14 +139,17 @@ async function handleRequest(request, env, ctx) {
 
     const videoFile = await uploadAndWait(upload.resultVideo, "result_screen_slowed", env);
     uploadedFiles.push(videoFile);
-    parts.push(filePart(videoFile));
+    parts.push(filePart(videoFile, upload.metadata.video_sample_fps));
 
     parts.push({
-      text: buildPrompt({
-        hasPlayerContextImage: Boolean(upload.contextImage),
-        resultStillCount: upload.resultStills.length,
-        playerNameExamples: upload.metadata.player_name_examples,
-      }),
+      text:
+        typeof upload.metadata.prompt === "string" && upload.metadata.prompt.trim()
+          ? upload.metadata.prompt
+          : buildPrompt({
+              hasPlayerContextImage: Boolean(upload.contextImage),
+              resultStillCount: upload.resultStills.length,
+              playerNameExamples: upload.metadata.player_name_examples,
+            }),
     });
 
     const result = await generateWithFallback(parts, env);
@@ -307,6 +311,7 @@ async function uploadAndWait(file, displayName, env) {
   const uploadResponse = await fetch(uploadUrl, {
     method: "POST",
     headers: {
+      "Content-Length": String(file.size),
       "X-Goog-Upload-Offset": "0",
       "X-Goog-Upload-Command": "upload, finalize",
     },
@@ -352,13 +357,20 @@ async function waitForFileActive(apiFile, env) {
   throw new HttpError(504, `Timed out waiting for Gemini file ${apiFile.name} to become ACTIVE`);
 }
 
-function filePart(apiFile) {
-  return {
-    file_data: {
-      mime_type: apiFile.mimeType || apiFile.mime_type || "application/octet-stream",
-      file_uri: apiFile.uri,
+function filePart(apiFile, videoSampleFps = null) {
+  const part = {
+    fileData: {
+      mimeType: apiFile.mimeType || apiFile.mime_type || "application/octet-stream",
+      fileUri: apiFile.uri,
     },
   };
+
+  const fps = Number(videoSampleFps);
+  if (Number.isFinite(fps) && fps > 0) {
+    part.videoMetadata = { fps };
+  }
+
+  return part;
 }
 
 async function generateWithFallback(parts, env) {
@@ -609,6 +621,33 @@ function jsonResponse(payload, status = 200, headers = {}) {
       ...headers,
     },
   });
+}
+
+function errorStatus(error) {
+  if (error instanceof HttpError) {
+    return error.status;
+  }
+  if (error instanceof GeminiApiError) {
+    return error.status === 429 ? 429 : 502;
+  }
+  return 500;
+}
+
+function errorPayload(error) {
+  if (error instanceof HttpError) {
+    return { error: error.message };
+  }
+  if (error instanceof GeminiApiError) {
+    return {
+      error: error.message,
+      gemini_status: error.status,
+      gemini_error: error.payload?.error,
+    };
+  }
+  return {
+    error: "Internal proxy error",
+    detail: error?.message || String(error),
+  };
 }
 
 function corsHeaders() {

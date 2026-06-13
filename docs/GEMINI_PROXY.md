@@ -55,3 +55,30 @@ GEMINI_PROXY_TOKEN=your_client_token
 ```
 
 It writes `testvideos/gemini_backend_comparison.json` and exits non-zero if the direct SDK output and Worker output differ for any video. If a test clip has a companion context image, name it with the same stem as the video, or use `context.png`, `frame_42.png`, or `player_context.png` in the same folder.
+
+## Inspect Gemini upload artifacts
+
+Gemini does not expose the exact internal video frames it samples. For debugging, you can save the exact local files and request metadata before they are sent to Gemini:
+
+```bash
+GEMINI_SAVE_DEBUG_ARTIFACTS=1
+GEMINI_DEBUG_ARTIFACT_DIR=local/gemini_debug
+```
+
+Then rerun a saved result-screen video:
+
+```bash
+python process_result_video.py local/matches/20260613_001914.mp4 --slowdown 10
+```
+
+Each run writes a timestamped folder containing:
+
+- `gemini_upload_result_screen_slowed.mp4` - the exact video file uploaded to Gemini.
+- `trimmed_result_video.mp4` - the first `GEMINI_MAX_RESULT_SCREEN_SECONDS` before slowdown.
+- `input_result_video.mp4` - the source file passed to the analyzer.
+- `prompt.txt` - the exact prompt sent through the Worker.
+- `request_metadata.json` - model, API version, sample FPS, slowdown, and video metadata.
+- `sample_manifest.json` - local frame sampling preview using `GEMINI_VIDEO_SAMPLE_FPS`.
+- `sample_contact_sheet.jpg` and `sampled_frames/` - visual preview frames from the upload video.
+
+The sampled-frame files are a local approximation based on the requested `GEMINI_VIDEO_SAMPLE_FPS`; they are not an official dump of Gemini's private internal frame picker.

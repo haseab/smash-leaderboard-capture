@@ -2,6 +2,9 @@ name = "smash-gemini-proxy"
 main = "cloudflare/gemini-proxy-worker.js"
 compatibility_date = "2026-06-11"
 
+[observability]
+enabled = true
+
 [vars]
 GEMINI_MODEL = "gemini-3.1-pro-preview"
 GEMINI_FALLBACK_MODELS = "gemini-3-pro-preview,gemini-3.1-flash-lite,gemini-3-flash-preview"

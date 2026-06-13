@@ -1,12 +1,14 @@
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import tempfile
 import time
 from typing import List, Optional
 
 import cv2
+import numpy as np
 import requests
 from google import genai
 from google.genai import types
@@ -28,6 +30,7 @@ DEFAULT_GEMINI_RETRY_DELAY_SECONDS = 300
 DEFAULT_MAX_RESULT_SCREEN_SECONDS = 10.0
 DEFAULT_GEMINI_API_VERSION = "v1beta"
 DEFAULT_GEMINI_PROXY_TIMEOUT_SECONDS = 900
+DEFAULT_GEMINI_DEBUG_ARTIFACT_DIR = os.path.join("local", "gemini_debug")
 
 
 class GeminiPlayerStats(BaseModel):
@@ -90,6 +93,7 @@ class GeminiProxyClient:
         result_still_paths: List[str],
         player_name_examples: Optional[str],
         video_sample_fps: float,
+        prompt_text: str,
     ) -> GeminiMatchStats:
         opened_files = []
         files = []
@@ -112,6 +116,7 @@ class GeminiProxyClient:
             metadata = {
                 "player_name_examples": player_name_examples,
                 "video_sample_fps": video_sample_fps,
+                "prompt": prompt_text,
             }
             response = requests.post(
                 self.proxy_url,
@@ -225,6 +230,27 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_filename(value: str) -> str:
+    return "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "_"
+        for character in value
+    ).strip("_") or "video"
+
+
+def _get_debug_artifact_dir(result_video_path: str) -> Optional[str]:
+    debug_dir = os.getenv("GEMINI_DEBUG_ARTIFACT_DIR", "").strip()
+    if not debug_dir and not _env_bool("GEMINI_SAVE_DEBUG_ARTIFACTS", False):
+        return None
+    if not debug_dir:
+        debug_dir = DEFAULT_GEMINI_DEBUG_ARTIFACT_DIR
+
+    source_name = _safe_filename(os.path.splitext(os.path.basename(result_video_path))[0])
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(debug_dir, f"{timestamp}_{source_name}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
 def _get_video_fps(video_path: str, fallback_fps: int = 30) -> int:
     cap = cv2.VideoCapture(video_path)
     try:
@@ -232,6 +258,226 @@ def _get_video_fps(video_path: str, fallback_fps: int = 30) -> int:
     finally:
         cap.release()
     return fps if fps > 0 else fallback_fps
+
+
+def _video_debug_metadata(video_path: str) -> dict:
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            return {"path": video_path, "opened": False}
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return {
+            "path": video_path,
+            "opened": True,
+            "fps": fps,
+            "frame_count": frame_count,
+            "duration_seconds": frame_count / fps if fps > 0 else None,
+            "width": width,
+            "height": height,
+        }
+    finally:
+        cap.release()
+
+
+def _copy_debug_artifact(source_path: Optional[str], output_dir: str, output_name: str, logger=None) -> Optional[str]:
+    if not source_path or not os.path.exists(source_path):
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    destination_path = os.path.join(output_dir, output_name)
+    try:
+        shutil.copy2(source_path, destination_path)
+        return destination_path
+    except Exception as exc:
+        _log(logger, "warning", f"Failed to save Gemini debug artifact {output_name}: {exc}")
+        return None
+
+
+def _write_debug_text(output_dir: str, filename: str, text: str, logger=None) -> Optional[str]:
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+    try:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            output_file.write(text)
+        return output_path
+    except Exception as exc:
+        _log(logger, "warning", f"Failed to write Gemini debug artifact {filename}: {exc}")
+        return None
+
+
+def _write_debug_json(output_dir: str, filename: str, payload: dict, logger=None) -> Optional[str]:
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+    try:
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            json.dump(payload, output_file, indent=2, sort_keys=True, default=str)
+            output_file.write("\n")
+        return output_path
+    except Exception as exc:
+        _log(logger, "warning", f"Failed to write Gemini debug artifact {filename}: {exc}")
+        return None
+
+
+def _save_video_sample_preview(
+    video_path: str,
+    output_dir: str,
+    sample_fps: float,
+    *,
+    logger=None,
+) -> List[dict]:
+    if sample_fps <= 0:
+        return []
+
+    frames_dir = os.path.join(output_dir, "sampled_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        _log(logger, "warning", f"Could not open video for Gemini sample preview: {video_path}")
+        return []
+
+    samples = []
+    thumbnails = []
+    try:
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if source_fps <= 0 or frame_count <= 0:
+            return []
+
+        duration_seconds = frame_count / source_fps
+        sample_interval = 1.0 / sample_fps
+        sample_index = 0
+        sample_time = 0.0
+        thumbnail_width = _env_int("GEMINI_DEBUG_THUMBNAIL_WIDTH", 320)
+
+        while sample_time < duration_seconds:
+            frame_index = min(frame_count - 1, max(0, int(round(sample_time * source_fps))))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            sample_index += 1
+            frame_filename = f"sample_{sample_index:04d}_t{sample_time:07.3f}s_f{frame_index:06d}.jpg"
+            frame_path = os.path.join(frames_dir, frame_filename)
+            cv2.imwrite(frame_path, frame)
+
+            height, width = frame.shape[:2]
+            thumbnail_height = max(1, int(height * (thumbnail_width / width))) if width > 0 else height
+            thumbnail = cv2.resize(frame, (thumbnail_width, thumbnail_height))
+            label = f"{sample_index:04d} {sample_time:.2f}s f{frame_index}"
+            cv2.rectangle(thumbnail, (0, 0), (thumbnail.shape[1], 28), (0, 0, 0), -1)
+            cv2.putText(thumbnail, label, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            thumbnails.append(thumbnail)
+
+            samples.append(
+                {
+                    "sample_number": sample_index,
+                    "sample_time_seconds": sample_time,
+                    "source_frame_index": frame_index,
+                    "frame_file": os.path.join("sampled_frames", frame_filename),
+                }
+            )
+            sample_time += sample_interval
+    finally:
+        cap.release()
+
+    if thumbnails:
+        columns = _env_int("GEMINI_DEBUG_CONTACT_SHEET_COLUMNS", 5)
+        columns = max(1, columns)
+        rows = (len(thumbnails) + columns - 1) // columns
+        tile_height = max(thumbnail.shape[0] for thumbnail in thumbnails)
+        tile_width = max(thumbnail.shape[1] for thumbnail in thumbnails)
+        sheet = np.full((rows * tile_height, columns * tile_width, 3), 255, dtype=np.uint8)
+
+        for index, thumbnail in enumerate(thumbnails):
+            row = index // columns
+            column = index % columns
+            y = row * tile_height
+            x = column * tile_width
+            sheet[y : y + thumbnail.shape[0], x : x + thumbnail.shape[1]] = thumbnail
+
+        cv2.imwrite(os.path.join(output_dir, "sample_contact_sheet.jpg"), sheet)
+
+    _write_debug_json(
+        output_dir,
+        "sample_manifest.json",
+        {
+            "note": (
+                "Gemini does not expose the exact frames it internally samples. "
+                "These frames are a local preview sampled from the exact video file sent to Gemini "
+                "using GEMINI_VIDEO_SAMPLE_FPS."
+            ),
+            "video_path": video_path,
+            "requested_video_sample_fps": sample_fps,
+            "video": _video_debug_metadata(video_path),
+            "samples": samples,
+        },
+        logger,
+    )
+    return samples
+
+
+def _save_gemini_debug_artifacts(
+    *,
+    debug_dir: str,
+    source_video_path: str,
+    analysis_video_path: str,
+    slowed_video_path: str,
+    context_image_path: Optional[str],
+    result_still_paths: List[str],
+    prompt_text: str,
+    model: str,
+    api_version: str,
+    video_sample_fps: float,
+    slowdown_factor: int,
+    output_fps: int,
+    max_result_seconds: float,
+    using_proxy: bool,
+    logger=None,
+):
+    _copy_debug_artifact(source_video_path, debug_dir, "input_result_video.mp4", logger)
+    _copy_debug_artifact(analysis_video_path, debug_dir, "trimmed_result_video.mp4", logger)
+    _copy_debug_artifact(slowed_video_path, debug_dir, "gemini_upload_result_screen_slowed.mp4", logger)
+
+    if context_image_path:
+        _copy_debug_artifact(
+            context_image_path,
+            debug_dir,
+            f"context_image{os.path.splitext(context_image_path)[1] or '.png'}",
+            logger,
+        )
+
+    stills_dir = os.path.join(debug_dir, "result_stills")
+    for index, still_path in enumerate(result_still_paths, start=1):
+        _copy_debug_artifact(still_path, stills_dir, f"result_screen_still_{index}.png", logger)
+
+    _write_debug_text(debug_dir, "prompt.txt", prompt_text, logger)
+    _save_video_sample_preview(slowed_video_path, debug_dir, video_sample_fps, logger=logger)
+    _write_debug_json(
+        debug_dir,
+        "request_metadata.json",
+        {
+            "note": "gemini_upload_result_screen_slowed.mp4 is the video file sent to Gemini.",
+            "using_proxy": using_proxy,
+            "model": model,
+            "api_version": api_version,
+            "video_sample_fps": video_sample_fps,
+            "slowdown_factor": slowdown_factor,
+            "output_fps": output_fps,
+            "max_result_seconds": max_result_seconds,
+            "source_video": _video_debug_metadata(source_video_path),
+            "trimmed_video": _video_debug_metadata(analysis_video_path),
+            "gemini_upload_video": _video_debug_metadata(slowed_video_path),
+            "context_image_path": context_image_path,
+            "result_still_count": len(result_still_paths),
+            "result_still_paths": result_still_paths,
+        },
+        logger,
+    )
+    _log(logger, "info", f"Saved Gemini debug artifacts to: {debug_dir}")
 
 
 def _slow_down_video(
@@ -679,6 +925,7 @@ def analyze_match_results_video(
     max_result_seconds = _env_float("GEMINI_MAX_RESULT_SCREEN_SECONDS", DEFAULT_MAX_RESULT_SCREEN_SECONDS)
     api_version = get_gemini_api_version()
     media_resolution_label = "HIGH" if _uses_v1alpha_api() else "default"
+    debug_dir = _get_debug_artifact_dir(result_video_path)
 
     uploaded_files = []
 
@@ -701,6 +948,31 @@ def analyze_match_results_video(
         )
         _log(logger, "info", f"Extracted {len(result_still_paths)} high-resolution result still(s).")
 
+        prompt_text = _build_prompt(
+            has_player_context_image=bool(context_image_path and os.path.exists(context_image_path)),
+            result_still_count=len(result_still_paths),
+            player_name_examples=player_name_examples,
+        )
+
+        if debug_dir:
+            _save_gemini_debug_artifacts(
+                debug_dir=debug_dir,
+                source_video_path=result_video_path,
+                analysis_video_path=analysis_video_path,
+                slowed_video_path=slowed_video_path,
+                context_image_path=context_image_path,
+                result_still_paths=result_still_paths,
+                prompt_text=prompt_text,
+                model=model,
+                api_version=api_version,
+                video_sample_fps=video_sample_fps,
+                slowdown_factor=slowdown_factor,
+                output_fps=output_fps,
+                max_result_seconds=max_result_seconds,
+                using_proxy=isinstance(client, GeminiProxyClient),
+                logger=logger,
+            )
+
         if isinstance(client, GeminiProxyClient):
             _log(logger, "info", f"Sending result screen assets to Gemini proxy: {client.proxy_url}")
             match_stats = client.analyze_match(
@@ -709,6 +981,7 @@ def analyze_match_results_video(
                 result_still_paths=result_still_paths,
                 player_name_examples=player_name_examples,
                 video_sample_fps=video_sample_fps,
+                prompt_text=prompt_text,
             )
             player_stats = _to_downstream_player_stats(match_stats)
             _log(logger, "info", f"Successfully extracted stats for {len(player_stats)} player(s).")
@@ -753,11 +1026,7 @@ def analyze_match_results_video(
 
             parts.append(
                 types.Part.from_text(
-                    text=_build_prompt(
-                        has_player_context_image=bool(context_image_path and os.path.exists(context_image_path)),
-                        result_still_count=len(result_still_paths),
-                        player_name_examples=player_name_examples,
-                    )
+                    text=prompt_text
                 )
             )
 
